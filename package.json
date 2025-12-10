@@ -1,0 +1,52 @@
+{
+  "name": "ixflix-backend",
+  "version": "1.0.0",
+  "description": "IXFLIX Backend API with Authentication",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "TZ=Asia/Dubai node src/index.js",
+    "dev": "TZ=Asia/Dubai nodemon src/index.js",
+    "migrate": "TZ=Asia/Dubai knex migrate:latest",
+    "migrate:rollback": "TZ=Asia/Dubai knex migrate:rollback",
+    "migrate:make": "TZ=Asia/Dubai knex migrate:make",
+    "seed": "TZ=Asia/Dubai knex seed:run",
+    "daily-rewards": "TZ=Asia/Dubai node scripts/daily-core-energy-reward.js",
+    "test-daily-rewards": "TZ=Asia/Dubai node scripts/test-daily-rewards.js",
+    "cron:core-harvest": "TZ=Asia/Dubai node scripts/daily-core-harvest.js",
+    "cron:synergy": "TZ=Asia/Dubai node scripts/daily-synergy.js",
+    "cron:rank": "TZ=Asia/Dubai node scripts/daily-rank-promote.js"
+  },
+  "keywords": [
+    "ixflix",
+    "authentication",
+    "express",
+    "api"
+  ],
+  "author": "IXFLIX",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "hi-base32": "^0.5.1",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "morgan": "^1.10.0",
+    "mysql2": "^3.6.5",
+    "nodemailer": "^7.0.11",
+    "otpauth": "^9.2.2",
+    "qrcode": "^1.5.3",
+    "speakeasy": "^2.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
