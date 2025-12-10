@@ -10,7 +10,6 @@
     "migrate:rollback": "TZ=Asia/Dubai knex migrate:rollback",
     "migrate:make": "TZ=Asia/Dubai knex migrate:make",
     "seed": "TZ=Asia/Dubai knex seed:run",
-    "daily-rewards": "TZ=Asia/Dubai node scripts/daily-core-energy-reward.js",
     "test-daily-rewards": "TZ=Asia/Dubai node scripts/test-daily-rewards.js",
     "cron:core-harvest": "TZ=Asia/Dubai node scripts/daily-core-harvest.js",
     "cron:synergy": "TZ=Asia/Dubai node scripts/daily-synergy.js",

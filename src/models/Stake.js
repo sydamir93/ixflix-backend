@@ -327,48 +327,7 @@ class Stake {
 
     const totalReward = coreReward + harvestReward;
 
-    // Check if adding this reward would exceed the maximum reward limit
-    const currentTotalRewards = parseFloat(stake.total_rewards_earned);
-    const maxRewards = parseFloat(stake.amount) * (parseFloat(stake.max_reward_limit) / 100);
-
-    if (currentTotalRewards + totalReward > maxRewards) {
-      // This would exceed the limit, so reduce the reward
-      const remainingReward = maxRewards - currentTotalRewards;
-      if (remainingReward <= 0) {
-        // Stake has reached its reward limit
-        await this.updateStatus(stakeId, 'completed');
-        return null;
-      }
-      // Adjust rewards proportionally
-      const ratio = remainingReward / totalReward;
-      const adjustedCoreReward = coreReward * ratio;
-      const adjustedHarvestReward = harvestReward * ratio;
-      const adjustedTotalReward = adjustedCoreReward + adjustedHarvestReward;
-
-      const [reward] = await db('stake_rewards')
-        .insert({
-          stake_id: stakeId,
-          reward_date: dateStr,
-          core_reward: adjustedCoreReward,
-          harvest_reward: adjustedHarvestReward,
-          total_reward: adjustedTotalReward,
-          status: 'pending',
-          created_at: db.fn.now()
-        })
-        .returning('*');
-
-      // Update stake's total rewards earned
-      await db('stakes')
-        .where({ id: stakeId })
-        .update({
-          total_rewards_earned: currentTotalRewards + adjustedTotalReward,
-          updated_at: db.fn.now()
-        });
-
-      return reward;
-    }
-
-    // Normal reward calculation
+    // Note: reward cap is enforced at claim time; we still create pending rewards here.
     const [reward] = await db('stake_rewards')
       .insert({
         stake_id: stakeId,
@@ -380,15 +339,6 @@ class Stake {
         created_at: db.fn.now()
       })
       .returning('*');
-
-    // Update stake's total rewards earned
-    await db('stakes')
-      .where({ id: stakeId })
-      .update({
-        total_rewards_earned: currentTotalRewards + totalReward,
-        last_reward_calculation: db.fn.now(),
-        updated_at: db.fn.now()
-      });
 
     return reward;
   }
@@ -403,20 +353,45 @@ class Stake {
         rewardsQuery = rewardsQuery.whereIn('id', rewardIds);
       }
 
-      const pendingRewards = await rewardsQuery;
+      const pendingRewards = await rewardsQuery.orderBy('reward_date', 'asc');
 
       if (pendingRewards.length === 0) {
         return { credited: 0, totalAmount: 0 };
       }
 
       const stake = await trx('stakes').where({ id: stakeId }).first();
+      const maxRewards = parseFloat(stake.amount) * (parseFloat(stake.max_reward_limit) / 100);
+      let currentTotalRewards = parseFloat(stake.total_rewards_earned || 0);
       let totalCredited = 0;
       let passupSkips = 0;
       let passupAllocations = 0;
 
       for (const reward of pendingRewards) {
-        const rewardAmount = parseFloat(reward.total_reward);
-        const coreAmount = parseFloat(reward.core_reward || 0);
+        // Expire rewards older than 24h (reward_date before today is considered expired by cron, but guard here too)
+        const rewardDate = new Date(`${reward.reward_date}T00:00:00Z`);
+        const nowUtc = new Date();
+        if (nowUtc.getTime() - rewardDate.getTime() > 24 * 3600 * 1000) {
+          await trx('stake_rewards')
+            .where({ id: reward.id })
+            .update({ status: 'expired', updated_at: trx.fn.now() });
+          continue;
+        }
+
+        // Apply remaining cap at claim time
+        const remainingCap = maxRewards - currentTotalRewards;
+        if (remainingCap <= 0) {
+          await trx('stake_rewards')
+            .where({ id: reward.id })
+            .update({ status: 'expired', updated_at: trx.fn.now() });
+          continue;
+        }
+
+        const rawRewardAmount = parseFloat(reward.total_reward);
+        const rawCoreAmount = parseFloat(reward.core_reward || 0);
+        const ratio = rawRewardAmount > remainingCap ? remainingCap / rawRewardAmount : 1;
+        const rewardAmount = rawRewardAmount * ratio;
+        const coreAmount = rawCoreAmount * ratio;
+        const harvestAmount = (parseFloat(reward.harvest_reward || 0)) * ratio;
 
         // Credit to user's wallet
         await trx('wallets')
@@ -456,14 +431,46 @@ class Stake {
           .where({ id: reward.id })
           .update({
             status: 'credited',
+            core_reward: coreAmount,
+            harvest_reward: harvestAmount,
+            total_reward: rewardAmount,
             credited_at: trx.fn.now()
           });
 
         totalCredited += rewardAmount;
+        currentTotalRewards += rewardAmount;
+      }
+
+      if (totalCredited > 0) {
+        await trx('stakes')
+          .where({ id: stakeId })
+          .update({
+            total_rewards_earned: currentTotalRewards,
+            updated_at: trx.fn.now()
+          });
+        if (currentTotalRewards >= maxRewards) {
+          await trx('stakes')
+            .where({ id: stakeId })
+            .update({
+              status: 'completed',
+              updated_at: trx.fn.now()
+            });
+        }
       }
 
       return { credited: pendingRewards.length, totalAmount: totalCredited, passupSkips, passupAllocations };
     });
+  }
+
+  // Expire pending rewards older than 24h (run daily in cron)
+  static async expirePendingRewards(runDate = new Date()) {
+    const dateStr = typeof runDate === 'string' ? runDate : runDate.toISOString().split('T')[0];
+    // Expire anything with reward_date before current run date
+    const expired = await db('stake_rewards')
+      .where('reward_date', '<', dateStr)
+      .andWhere({ status: 'pending' })
+      .update({ status: 'expired', updated_at: db.fn.now() });
+    return expired;
   }
 
   // Update stake status
@@ -566,6 +573,8 @@ class Stake {
 
     await JobRun.start('core_harvest', dateStr, { note: 'Daily core+harvest' });
 
+    const expired = await Stake.expirePendingRewards(runDate);
+
     const activeStakes = await db('stakes')
       .where({ status: 'active' })
       .select('id');
@@ -588,10 +597,11 @@ class Stake {
     await JobRun.finish('core_harvest', dateStr, 'success', {
       processed,
       rewardsCreated,
-      capHits
+      capHits,
+      expired
     });
 
-    return { stakes_processed: processed, rewards_created: rewardsCreated, capHits };
+    return { stakes_processed: processed, rewards_created: rewardsCreated, capHits, expired };
   }
 }
 
