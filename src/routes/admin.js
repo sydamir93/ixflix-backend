@@ -12,6 +12,9 @@ router.put('/users/:userId', adminController.updateUser);
 router.post('/users/:userId/remove-2fa', adminController.removeUser2FA);
 router.post('/users/:userId/manual-deposit', adminController.manualDepositToUser);
 
+// Stakes
+router.get('/stakes', adminController.listStakes);
+
 // Deposits
 router.get('/deposits', adminController.listDeposits);
 router.post('/deposits/:transactionId/requery', adminController.requeryDepositStatus);

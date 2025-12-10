@@ -563,9 +563,74 @@ const requeryWithdrawalStatus = async (req, res) => {
   }
 };
 
+// Admin: list stakes with user info
+const listStakes = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || DEFAULT_PAGE_SIZE;
+    const offset = (page - 1) * limit;
+    const { status, pack_type: packType, user_id: userId, search } = req.query;
+
+    const baseQuery = db('stakes as s')
+      .join('users as u', 's.user_id', 'u.id');
+
+    if (status) {
+      baseQuery.andWhere('s.status', status);
+    }
+
+    if (packType) {
+      baseQuery.andWhere('s.pack_type', packType);
+    }
+
+    if (userId) {
+      baseQuery.andWhere('s.user_id', userId);
+    }
+
+    if (search) {
+      baseQuery.andWhere((qb) => {
+        qb.where('u.phone_number', 'like', `%${search}%`)
+          .orWhere('u.email', 'like', `%${search}%`)
+          .orWhere('u.name', 'like', `%${search}%`);
+      });
+    }
+
+    const [rows, [{ count }]] = await Promise.all([
+      baseQuery
+        .clone()
+        .select(
+          's.*',
+          'u.name as user_name',
+          'u.email as user_email',
+          'u.phone_number as user_phone'
+        )
+        .orderBy('s.created_at', 'desc')
+        .limit(limit)
+        .offset(offset),
+      baseQuery.clone().count('* as count')
+    ]);
+
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        stakes: rows,
+        pagination: {
+          page,
+          limit,
+          total: parseInt(count, 10) || 0,
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('List stakes (admin) failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch stakes' });
+  }
+};
+
 module.exports = {
   listDeposits,
   listWithdrawals,
+  listStakes,
   listUsers,
   updateUser,
   removeUser2FA,
