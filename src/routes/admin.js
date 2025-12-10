@@ -22,6 +22,7 @@ router.post('/withdrawals/:transactionId/requery', adminController.requeryWithdr
 
 // NowPayments diagnostics
 router.get('/nowpayments/status', adminController.getNowPaymentsStatus);
+router.get('/nowpayments/balance', adminController.getNowPaymentsBalance);
 
 module.exports = router;
 

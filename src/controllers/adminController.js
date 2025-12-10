@@ -402,6 +402,22 @@ const getNowPaymentsStatus = async (_req, res) => {
   }
 };
 
+// Admin: get NowPayments balance
+const getNowPaymentsBalance = async (_req, res) => {
+  try {
+    const balance = await NowPaymentService.getBalance();
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        nowpayments: balance
+      }
+    });
+  } catch (error) {
+    logger.error('NowPayments balance check failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch balance' });
+  }
+};
+
 // Admin: requery deposit status with NowPayments
 const requeryDepositStatus = async (req, res) => {
   try {
@@ -555,6 +571,7 @@ module.exports = {
   removeUser2FA,
   manualDepositToUser,
   getNowPaymentsStatus,
+  getNowPaymentsBalance,
   requeryDepositStatus,
   requeryWithdrawalStatus
 };

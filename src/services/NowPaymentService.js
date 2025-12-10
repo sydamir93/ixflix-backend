@@ -301,6 +301,23 @@ class NowPaymentService {
       throw error;
     }
   }
+
+  // Get overall balance (NowPayments /balance endpoint)
+  async getBalance() {
+    try {
+      const response = await axios.get(`${this.apiUrl}/balance`, {
+        headers: {
+          'x-api-key': this.apiKey
+        },
+        timeout: 10000
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('Error getting balance:', error.response?.data || error.message);
+      throw error;
+    }
+  }
 }
 
 module.exports = new NowPaymentService();
