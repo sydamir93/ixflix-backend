@@ -8,6 +8,7 @@ router.use(authenticate, authorizeAdmin);
 
 // Users
 router.get('/users', adminController.listUsers);
+router.get('/users/:userId/wallet', adminController.getUserWalletBalance);
 router.put('/users/:userId', adminController.updateUser);
 router.post('/users/:userId/remove-2fa', adminController.removeUser2FA);
 router.post('/users/:userId/manual-deposit', adminController.manualDepositToUser);

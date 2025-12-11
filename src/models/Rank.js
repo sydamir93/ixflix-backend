@@ -18,16 +18,26 @@ async function ensureRankRow(userId, trx = null) {
   const query = trx || db;
   const existing = await query('user_ranks').where({ user_id: userId }).first();
   if (existing) return existing;
-  const [row] = await query('user_ranks')
-    .insert({
-      user_id: userId,
-      rank: 'unranked',
-      override_percent: 0,
-      created_at: query.fn.now(),
-      updated_at: query.fn.now()
-    })
-    .returning('*');
-  return row;
+
+  try {
+    const [row] = await query('user_ranks')
+      .insert({
+        user_id: userId,
+        rank: 'unranked',
+        override_percent: 0,
+        created_at: query.fn.now(),
+        updated_at: query.fn.now()
+      })
+      .returning('*');
+    // MySQL may return an empty array on returning(); fall back to select
+    return row || (await query('user_ranks').where({ user_id: userId }).first());
+  } catch (err) {
+    // If another request inserted concurrently, return the existing row
+    if (err && (err.code === 'ER_DUP_ENTRY' || err.code === 'SQLITE_CONSTRAINT')) {
+      return await query('user_ranks').where({ user_id: userId }).first();
+    }
+    throw err;
+  }
 }
 
 async function getDirectReferralsCount(userId) {

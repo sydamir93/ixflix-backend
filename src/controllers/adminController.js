@@ -185,7 +185,8 @@ const listUsers = async (req, res) => {
     const offset = (page - 1) * limit;
     const { role, search } = req.query;
 
-    const baseQuery = db('users');
+    const baseQuery = db('users')
+      .leftJoin('two_factor_auth as tfa', 'users.id', 'tfa.user_id');
 
     if (role) {
       baseQuery.andWhere('role', role);
@@ -202,7 +203,19 @@ const listUsers = async (req, res) => {
     const [rows, [{ count }]] = await Promise.all([
       baseQuery
         .clone()
-        .select('id', 'name', 'email', 'phone_number', 'role', 'is_active', 'is_verified', 'created_at', 'updated_at', 'referral_code')
+        .select(
+          'users.id',
+          'users.name',
+          'users.email',
+          'users.phone_number',
+          'users.role',
+          'users.is_active',
+          'users.is_verified',
+          'users.created_at',
+          'users.updated_at',
+          'users.referral_code',
+          db.raw('COALESCE(tfa.is_enabled, false) as has_2fa')
+        )
         .orderBy('created_at', 'desc')
         .limit(limit)
         .offset(offset),
@@ -383,6 +396,27 @@ const manualDepositToUser = async (req, res) => {
   } catch (error) {
     logger.error('Manual deposit (admin) failed', { error: error.message, stack: error.stack });
     return res.status(500).json({ status: 'ERROR', message: 'Failed to process manual deposit' });
+  }
+};
+
+// Admin: fetch a user's wallet balance
+const getUserWalletBalance = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const wallet = await Wallet.getOrCreateBothWallets(userId);
+    const balances = await Wallet.getBothBalances(userId);
+
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        wallet: wallet.main,
+        balance: balances.main,
+        total_balance: balances.main
+      }
+    });
+  } catch (error) {
+    logger.error('Get user wallet (admin) failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch user wallet' });
   }
 };
 
@@ -635,6 +669,7 @@ module.exports = {
   updateUser,
   removeUser2FA,
   manualDepositToUser,
+  getUserWalletBalance,
   getNowPaymentsStatus,
   getNowPaymentsBalance,
   requeryDepositStatus,
