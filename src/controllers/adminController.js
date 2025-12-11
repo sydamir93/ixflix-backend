@@ -372,7 +372,7 @@ const manualDepositToUser = async (req, res) => {
         }),
         created_at: trx.fn.now(),
         updated_at: trx.fn.now()
-      }).returning('*');
+      });
 
       let transactionRow = Array.isArray(insertResult) ? insertResult[0] : insertResult;
 

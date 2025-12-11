@@ -328,19 +328,19 @@ class Stake {
     const totalReward = coreReward + harvestReward;
 
     // Note: reward cap is enforced at claim time; we still create pending rewards here.
-    const [reward] = await db('stake_rewards')
-      .insert({
-        stake_id: stakeId,
-        reward_date: dateStr,
-        core_reward: coreReward,
-        harvest_reward: harvestReward,
-        total_reward: totalReward,
-        status: 'pending',
-        created_at: db.fn.now()
-      })
-      .returning('*');
+    await db('stake_rewards').insert({
+      stake_id: stakeId,
+      reward_date: dateStr,
+      core_reward: coreReward,
+      harvest_reward: harvestReward,
+      total_reward: totalReward,
+      status: 'pending',
+      created_at: db.fn.now()
+    });
 
-    return reward;
+    return await db('stake_rewards')
+      .where({ stake_id: stakeId, reward_date: dateStr })
+      .first();
   }
 
   // Credit pending rewards to user's wallet
@@ -475,13 +475,14 @@ class Stake {
 
   // Update stake status
   static async updateStatus(id, status) {
-    return await db('stakes')
+    await db('stakes')
       .where({ id })
       .update({
         status,
         updated_at: db.fn.now()
-      })
-      .returning('*');
+      });
+
+    return await db('stakes').where({ id }).first();
   }
 
   // Get stake rewards history

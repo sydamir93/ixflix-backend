@@ -18,10 +18,8 @@ class Synergy {
     const query = trx || db;
     const existing = await query('team_volumes').where({ user_id: userId }).first();
     if (existing) return existing;
-    const [row] = await query('team_volumes')
-      .insert({ user_id: userId, created_at: query.fn.now(), updated_at: query.fn.now() })
-      .returning('*');
-    return row;
+    await query('team_volumes').insert({ user_id: userId, created_at: query.fn.now(), updated_at: query.fn.now() });
+    return await query('team_volumes').where({ user_id: userId }).first();
   }
 
   // Eligibility: at least 1 active direct on left AND 1 active direct on right with an active stake

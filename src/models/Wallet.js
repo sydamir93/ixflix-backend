@@ -13,13 +13,16 @@ class Wallet {
     }
 
     // Create main wallet if it doesn't exist
-    const [mainWallet] = await db('wallets')
+    await db('wallets')
       .insert({
         user_id: userId,
         wallet_type: 'main',
         balance: 0
-      })
-      .returning('*');
+      });
+
+    const mainWallet = await db('wallets')
+      .where({ user_id: userId, wallet_type: 'main' })
+      .first();
 
     return { main: mainWallet };
   }

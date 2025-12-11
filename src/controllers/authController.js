@@ -250,13 +250,14 @@ async function register(req, res) {
         phone_verified_at: new Date()
       };
 
-      const userId = await trx('users').insert(userData).returning('id');
+      const insertResult = await trx('users').insert(userData);
+      const userId = Array.isArray(insertResult) ? insertResult[0] : insertResult;
 
       // Create genealogy record
       const genealogyData = {
-        user_id: userId[0],
+        user_id: userId,
         parent_id: parentId, // null for root users
-        sponsor_id: sponsorUser ? sponsorUser.id : userId[0], // self-sponsored for root users
+        sponsor_id: sponsorUser ? sponsorUser.id : userId, // self-sponsored for root users
         position: position // null for root users
       };
 
@@ -264,14 +265,14 @@ async function register(req, res) {
 
       // Create wallet for the new user
       await trx('wallets').insert({
-        user_id: userId[0],
+        user_id: userId,
         balance: 0,
         created_at: trx.fn.now(),
         updated_at: trx.fn.now()
       });
 
       return {
-        userId: userId[0],
+        userId,
         referralCode: userReferralCode,
         position: position,
         parentId: parentId,

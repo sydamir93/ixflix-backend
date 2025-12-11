@@ -21,7 +21,7 @@ exports.seed = async function(knex) {
   const referralCode = 'IX-' + timestamp + randomNum;
 
   // Insert admin user
-  const [userId] = await knex('users').insert({
+  const insertResult = await knex('users').insert({
     phone_number: '+60162167517', // Placeholder phone number
     password: hashedPassword,
     email: 'admin@ixflix.com',
@@ -34,7 +34,9 @@ exports.seed = async function(knex) {
     phone_verified_at: knex.fn.now(),
     created_at: knex.fn.now(),
     updated_at: knex.fn.now()
-  }).returning('id');
+  });
+
+  const userId = Array.isArray(insertResult) ? insertResult[0] : insertResult;
 
   // Create genealogy record (admin is a root user)
   await knex('genealogy').insert({

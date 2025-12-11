@@ -3,23 +3,32 @@ const db = require('../config/database');
 class Transaction {
   // Create a new transaction
   static async create(data) {
-    const [transaction] = await db('transactions')
-      .insert({
-        user_id: data.user_id,
-        wallet_type: data.wallet_type || 'main',
-        transaction_type: data.transaction_type,
-        reference_type: data.reference_type,
-        reference_id: data.reference_id,
-        amount: data.amount,
-        fee: data.fee || 0,
-        currency: data.currency || 'USD',
-        status: data.status || 'pending',
-        description: data.description,
-        metadata: data.metadata ? JSON.stringify(data.metadata) : null,
-        created_at: db.fn.now(),
-        updated_at: db.fn.now()
-      })
-      .returning('*');
+    const insertResult = await db('transactions').insert({
+      user_id: data.user_id,
+      wallet_type: data.wallet_type || 'main',
+      transaction_type: data.transaction_type,
+      reference_type: data.reference_type,
+      reference_id: data.reference_id,
+      amount: data.amount,
+      fee: data.fee || 0,
+      currency: data.currency || 'USD',
+      status: data.status || 'pending',
+      description: data.description,
+      metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+      created_at: db.fn.now(),
+      updated_at: db.fn.now()
+    });
+
+    const insertId = Array.isArray(insertResult) ? insertResult[0] : insertResult;
+    const transaction = await db('transactions').where({ id: insertId }).first();
+
+    if (transaction && typeof transaction.metadata === 'string') {
+      try {
+        transaction.metadata = JSON.parse(transaction.metadata);
+      } catch (err) {
+        transaction.metadata = null;
+      }
+    }
 
     return transaction;
   }
@@ -212,8 +221,7 @@ class Transaction {
 
     const result = await db('transactions')
       .where({ id })
-      .update(updateData)
-      .returning('*');
+      .update(updateData);
 
     let transaction = null;
 
@@ -249,8 +257,7 @@ class Transaction {
 
     const result = await query('transactions')
       .where({ id })
-      .update(updateData)
-      .returning('*');
+      .update(updateData);
 
     let updatedTransaction = null;
 

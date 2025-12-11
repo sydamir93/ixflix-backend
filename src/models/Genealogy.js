@@ -249,12 +249,13 @@ class Genealogy {
   // Create a new genealogy record
   static async create(genealogyData) {
     try {
-      const [genealogyId] = await db('genealogy').insert({
+      const insertResult = await db('genealogy').insert({
         ...genealogyData,
         created_at: db.fn.now(),
         updated_at: db.fn.now()
-      }).returning('id');
+      });
 
+      const genealogyId = Array.isArray(insertResult) ? insertResult[0] : insertResult;
       return genealogyId;
     } catch (error) {
       console.error('Error creating genealogy record:', error);
