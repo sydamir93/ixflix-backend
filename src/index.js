@@ -17,6 +17,8 @@ const adminRoutes = require('./routes/admin');
 
 // Initialize express app
 const app = express();
+const trustProxy = process.env.TRUST_PROXY !== 'false';
+app.set('trust proxy', trustProxy);
 const PORT = process.env.PORT || 3000;
 
 // Security middleware
