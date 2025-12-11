@@ -6,7 +6,10 @@ const synergyController = require('../controllers/synergyController');
 const jobController = require('../controllers/jobController');
 const { authenticate } = require('../middleware/auth');
 
-// All wallet routes require authentication
+// Handle deposit callback from NowPayment (no auth required for callbacks)
+router.post('/deposit/callback', walletController.handleDepositCallback);
+
+// All wallet routes below this point require authentication
 router.use(authenticate);
 
 // Get wallet balance
@@ -26,9 +29,6 @@ router.get('/incentives/summary', walletController.getIncentiveSummary);
 
 // Initiate deposit
 router.post('/deposit', walletController.initiateDeposit);
-
-// Handle deposit callback from NowPayment (no auth required for callbacks)
-router.post('/deposit/callback', walletController.handleDepositCallback);
 
 // Initiate withdrawal via NowPayments payout
 router.post('/withdraw', walletController.initiateWithdraw);
