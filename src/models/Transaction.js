@@ -210,12 +210,24 @@ class Transaction {
       updateData.metadata = JSON.stringify(updates.metadata);
     }
 
-    const [transaction] = await db('transactions')
+    const result = await db('transactions')
       .where({ id })
       .update(updateData)
       .returning('*');
 
-    if (transaction && transaction.metadata) {
+    let transaction = null;
+
+    if (Array.isArray(result)) {
+      transaction = result[0] || null;
+    } else if (result && typeof result === 'object') {
+      transaction = result;
+    }
+
+    if (!transaction) {
+      transaction = await db('transactions').where({ id }).first();
+    }
+
+    if (transaction && typeof transaction.metadata === 'string') {
       transaction.metadata = JSON.parse(transaction.metadata);
     }
 
@@ -235,16 +247,30 @@ class Transaction {
       updateData.metadata = JSON.stringify(metadata);
     }
 
-    const [transaction] = await query('transactions')
+    const result = await query('transactions')
       .where({ id })
       .update(updateData)
       .returning('*');
 
-    if (transaction && transaction.metadata) {
-      transaction.metadata = JSON.parse(transaction.metadata);
+    let updatedTransaction = null;
+
+    if (Array.isArray(result)) {
+      updatedTransaction = result[0] || null;
+    } else if (result && typeof result === 'object') {
+      updatedTransaction = result;
     }
 
-    return transaction;
+    if (!updatedTransaction) {
+      updatedTransaction = await query('transactions')
+        .where({ id })
+        .first();
+    }
+
+    if (updatedTransaction && typeof updatedTransaction.metadata === 'string') {
+      updatedTransaction.metadata = JSON.parse(updatedTransaction.metadata);
+    }
+
+    return updatedTransaction;
   }
 }
 
