@@ -3,6 +3,7 @@ const Wallet = require('../models/Wallet');
 const Transaction = require('../models/Transaction');
 const NowPaymentService = require('../services/NowPaymentService');
 const { logger } = require('../utils/logger');
+const bcrypt = require('bcryptjs');
 
 const DEFAULT_PAGE_SIZE = 25;
 
@@ -244,7 +245,7 @@ const listUsers = async (req, res) => {
 const updateUser = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { name, email, phoneNumber, role, is_active: isActive } = req.body;
+    const { name, email, phoneNumber, role, is_active: isActive, password } = req.body;
     const updates = {};
 
     const user = await db('users').where({ id: userId }).first();
@@ -279,6 +280,13 @@ const updateUser = async (req, res) => {
 
     if (typeof isActive === 'boolean') {
       updates.is_active = isActive;
+    }
+
+    if (password) {
+      if (typeof password !== 'string' || password.length < 8) {
+        return res.status(400).json({ status: 'ERROR', message: 'Password must be at least 8 characters' });
+      }
+      updates.password = await bcrypt.hash(password, 10);
     }
 
     if (Object.keys(updates).length === 0) {
