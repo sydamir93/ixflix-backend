@@ -14,14 +14,14 @@ const RANKS = {
   quantum: 100
 };
 
-// Get user rank percent; default to 0 if none
+// Get user rank percent; evaluate live eligibility against ladder requirements
 async function getUserRankPercent(userId) {
-  const rankRow = await db('user_ranks').where({ user_id: userId }).first();
-  if (rankRow?.override_percent !== undefined && rankRow?.override_percent !== null) {
-    return Number(rankRow.override_percent);
-  }
-  if (rankRow?.rank && RANKS[rankRow.rank] !== undefined) {
-    return RANKS[rankRow.rank];
+  // Lazy-load to avoid circular import when Stake -> PowerPassUp -> Rank -> Stake
+  const Rank = require('./Rank');
+  const evalResult = await Rank.evaluateUserRank(userId);
+  if (evalResult?.targetPercent) return Number(evalResult.targetPercent);
+  if (evalResult?.targetRank && RANKS[evalResult.targetRank] !== undefined) {
+    return RANKS[evalResult.targetRank];
   }
   return 0;
 }
