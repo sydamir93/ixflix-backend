@@ -107,6 +107,7 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
 module.exports = {
   distributePowerPassUp,
   getUserRankPercent,
+  getSponsorChain,
   RANKS
 };
 
