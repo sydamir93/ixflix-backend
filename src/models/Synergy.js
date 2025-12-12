@@ -2,6 +2,7 @@ const db = require('../config/database');
 const Stake = require('./Stake');
 const Genealogy = require('./Genealogy');
 const JobRun = require('./JobRun');
+const RewardCap = require('./RewardCap');
 
 // Synergy Flow rates by pack
 const SYNERGY_RATES = {

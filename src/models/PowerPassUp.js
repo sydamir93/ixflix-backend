@@ -51,6 +51,10 @@ async function getSponsorChain(userId, maxLevels = 9) {
 async function distributePowerPassUp({ originUserId, coreAmount, referenceId, trx = db }) {
   if (!coreAmount || coreAmount <= 0) return { distributed: 0, allocations: [] };
 
+  // Get the origin user's name for the description
+  const originUser = await trx('users').where({ id: originUserId }).select('name').first();
+  const originUserName = originUser?.name || `User ${originUserId}`;
+
   const chain = await getSponsorChain(originUserId, 9);
   const allocations = [];
 
@@ -86,7 +90,7 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
       amount: allowed,
       currency: 'USD',
       status: 'completed',
-      description: `Power Pass-Up from stake reward ${referenceId} (${diff}% override)`,
+      description: `Power Pass-Up from ${originUserName} (${diff}% override)`,
       created_at: trx.fn.now(),
       updated_at: trx.fn.now()
     });

@@ -28,6 +28,9 @@ router.post('/withdrawals/:transactionId/requery', adminController.requeryWithdr
 router.get('/nowpayments/status', adminController.getNowPaymentsStatus);
 router.get('/nowpayments/balance', adminController.getNowPaymentsBalance);
 
+// Genealogy
+router.get('/pairing-genealogy', adminController.getPairingGenealogy);
+
 module.exports = router;
 
 

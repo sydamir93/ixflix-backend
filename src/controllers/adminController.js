@@ -669,11 +669,96 @@ const listStakes = async (req, res) => {
   }
 };
 
+// Admin: get pairing genealogy tree (binary tree based on parent_id and position)
+const getPairingGenealogy = async (req, res) => {
+  try {
+    const { userId, depth = 10 } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({
+        status: 'ERROR',
+        message: 'userId parameter is required'
+      });
+    }
+
+    // Build pairing genealogy tree (binary tree)
+    const pairingTree = await buildPairingTree(parseInt(userId), parseInt(depth));
+
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        userId: parseInt(userId),
+        pairingTree
+      }
+    });
+  } catch (error) {
+    logger.error('Get pairing genealogy (admin) failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch pairing genealogy' });
+  }
+};
+
+// Helper function to build pairing genealogy tree (binary tree based on parent/position)
+async function buildPairingTree(rootUserId, maxDepth = 10, currentDepth = 0, visited = new Set()) {
+  if (currentDepth >= maxDepth) return null;
+
+  // Prevent cycles
+  if (visited.has(rootUserId)) return null;
+  visited.add(rootUserId);
+
+  // Get user details
+  const user = await db('users')
+    .where('id', rootUserId)
+    .select('id', 'name', 'email', 'phone_number', 'created_at')
+    .first();
+
+  if (!user) return null;
+
+  // Get left and right children
+  const leftChild = await db('genealogy')
+    .where('parent_id', rootUserId)
+    .where('position', 'left')
+    .join('users', 'genealogy.user_id', 'users.id')
+    .select(
+      'genealogy.user_id as id',
+      'users.name',
+      'users.email',
+      'users.phone_number',
+      'users.created_at'
+    )
+    .first();
+
+  const rightChild = await db('genealogy')
+    .where('parent_id', rootUserId)
+    .where('position', 'right')
+    .join('users', 'genealogy.user_id', 'users.id')
+    .select(
+      'genealogy.user_id as id',
+      'users.name',
+      'users.email',
+      'users.phone_number',
+      'users.created_at'
+    )
+    .first();
+
+  // Build the tree node
+  const node = {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    phone_number: user.phone_number,
+    joined_at: user.created_at,
+    left: leftChild ? await buildPairingTree(leftChild.id, maxDepth, currentDepth + 1, new Set(visited)) : null,
+    right: rightChild ? await buildPairingTree(rightChild.id, maxDepth, currentDepth + 1, new Set(visited)) : null
+  };
+
+  return node;
+}
+
 module.exports = {
+  listUsers,
+  listStakes,
   listDeposits,
   listWithdrawals,
-  listStakes,
-  listUsers,
   updateUser,
   removeUser2FA,
   manualDepositToUser,
@@ -681,7 +766,8 @@ module.exports = {
   getNowPaymentsStatus,
   getNowPaymentsBalance,
   requeryDepositStatus,
-  requeryWithdrawalStatus
+  requeryWithdrawalStatus,
+  getPairingGenealogy
 };
 
 
