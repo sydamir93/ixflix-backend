@@ -393,10 +393,16 @@ class Stake {
         const coreAmount = rawCoreAmount * ratio;
         const harvestAmount = (parseFloat(reward.harvest_reward || 0)) * ratio;
 
-        // Credit to user's wallet
+        // Calculate staker's entitled portion of core reward
+        const { getUserRankPercent } = require('./PowerPassUp');
+        const stakerRankPercent = await getUserRankPercent(stake.user_id);
+        const stakerCorePortion = coreAmount * (stakerRankPercent / 100);
+        const stakerTotalCredit = harvestAmount + stakerCorePortion;
+
+        // Credit to user's wallet (harvest + staker's core portion)
         await trx('wallets')
           .where({ user_id: stake.user_id, wallet_type: 'main' })
-          .increment('balance', rewardAmount);
+          .increment('balance', stakerTotalCredit);
 
         // Create transaction record
         await trx('transactions').insert({
@@ -405,24 +411,27 @@ class Stake {
           transaction_type: 'stake_reward',
           reference_type: 'stake_reward',
           reference_id: reward.id.toString(),
-          amount: rewardAmount,
+          amount: stakerTotalCredit,
           currency: 'USD',
           status: 'completed',
-          description: `Stake reward for ${stake.pack_type} pack - ${reward.reward_date}`,
+          description: `Stake reward for ${stake.pack_type} pack (${stakerRankPercent}% core share) - ${reward.reward_date}`,
           created_at: trx.fn.now(),
           updated_at: trx.fn.now()
         });
 
-        // Power Pass-Up on Core Energy Reward portion
-        if (coreAmount > 0) {
+        // Power Pass-Up on remaining Core Energy Reward portion
+        const remainingCoreAmount = coreAmount - stakerCorePortion;
+
+        // For PDF-compliant, we ignore staker rank; baseline = 0
+        if (remainingCoreAmount > 0) {
           const passRes = await distributePowerPassUp({
             originUserId: stake.user_id,
-            coreAmount,
+            coreAmount: remainingCoreAmount,
             referenceId: reward.id,
             trx
           });
           passupAllocations += passRes.allocations?.length || 0;
-          // If nothing distributed for this core portion, count as skip (cap/ineligible)
+          // Track skips (optional)
           if ((passRes.distributed || 0) <= 0) passupSkips += 1;
         }
 

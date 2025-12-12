@@ -14,19 +14,21 @@ const RANKS = {
   quantum: 100
 };
 
-// Get user rank percent; evaluate live eligibility against ladder requirements
+// Get user rank percent based on live eligibility
 async function getUserRankPercent(userId) {
-  // Lazy-load to avoid circular import when Stake -> PowerPassUp -> Rank -> Stake
   const Rank = require('./Rank');
   const evalResult = await Rank.evaluateUserRank(userId);
+
   if (evalResult?.targetPercent) return Number(evalResult.targetPercent);
+
   if (evalResult?.targetRank && RANKS[evalResult.targetRank] !== undefined) {
     return RANKS[evalResult.targetRank];
   }
+
   return 0;
 }
 
-// Fetch sponsor upline chain (distinct, avoid loops)
+// Fetch upline chain (max 9 levels)
 async function getSponsorChain(userId, maxLevels = 9) {
   const chain = [];
   const visited = new Set();
@@ -35,59 +37,59 @@ async function getSponsorChain(userId, maxLevels = 9) {
   for (let i = 0; i < maxLevels; i++) {
     const row = await db('genealogy').where({ user_id: current }).first();
     if (!row || !row.sponsor_id || visited.has(row.sponsor_id)) break;
+
     chain.push(row.sponsor_id);
     visited.add(row.sponsor_id);
     current = row.sponsor_id;
   }
+
   return chain;
 }
 
 /**
- * Distribute Power Pass-Up on a credited Core Energy Reward.
- * - Higher rank overrides lower rank percentages
- * - Each upline sponsor gets the difference between their rank % and the previous rank %
- * - Origin user does NOT keep any portion - entire core reward is distributed upline
- * - Ensures 100% of Core Energy Reward is fully allocated among eligible ranks
- * - Only core_reward is used for overrides (not harvest).
+ * PDF-Compliant Power Pass-Up
+ * - Origin user keeps their core reward (rank-independent)
+ * - Each upline earns override ONLY if rank% > previous rank in chain
+ * - Override = difference between upline rank and previous rank
+ * - All overrides are computed from the **original core reward** amount
+ * - Skipped lower/equal rank uplines do not change baseline
+ * - Any unearned portion can be retained by the company
  */
 async function distributePowerPassUp({ originUserId, coreAmount, referenceId, trx = db }) {
   if (!coreAmount || coreAmount <= 0) return { distributed: 0, allocations: [] };
 
-  // Get the origin user's name for the description
   const originUser = await trx('users').where({ id: originUserId }).select('name').first();
   const originUserName = originUser?.name || `User ${originUserId}`;
 
   const chain = await getSponsorChain(originUserId, 9);
   const allocations = [];
 
-  // Build rank chain with percentages (filter out unranked users)
-  const rankChain = [];
+  let previousRankPercent = 0; // PDF-compliant: always start baseline at 0
+
   for (const sponsorId of chain) {
-    const sponsorPercent = await getUserRankPercent(sponsorId);
-    if (sponsorPercent > 0) {
-      rankChain.push({ sponsorId, sponsorPercent });
+    const sponsorRankPercent = await getUserRankPercent(sponsorId);
+
+    // Skip unranked or lower/equal rank sponsors
+    if (sponsorRankPercent <= previousRankPercent) continue;
+
+    const overridePercent = sponsorRankPercent - previousRankPercent;
+    const earnedAmount = (overridePercent / 100) * coreAmount;
+
+    if (earnedAmount <= 0) {
+      previousRankPercent = sponsorRankPercent;
+      continue;
     }
-  }
 
-  // Sort by rank percentage ascending (lowest to highest)
-  rankChain.sort((a, b) => a.sponsorPercent - b.sponsorPercent);
-
-  let previousPercent = 0;
-  let totalDistributedPercent = 0;
-
-  for (const { sponsorId, sponsorPercent } of rankChain) {
-    const overridePercent = sponsorPercent - previousPercent;
-    if (overridePercent <= 0) continue;
-
-    const rawReward = coreAmount * (overridePercent / 100);
-    const { allowed } = await RewardCap.clampIncentive(sponsorId, rawReward, trx);
+    // Apply RewardCap
+    const { allowed } = await RewardCap.clampIncentive(sponsorId, earnedAmount, trx);
 
     if (allowed > 0) {
-      // Make the payment
+      // Credit wallet
       await trx('wallets')
         .where({ user_id: sponsorId, wallet_type: 'main' })
         .increment('balance', allowed);
 
+      // Record transaction
       await trx('transactions').insert({
         user_id: sponsorId,
         wallet_type: 'main',
@@ -102,45 +104,15 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
         updated_at: trx.fn.now()
       });
 
-      allocations.push({ sponsorId, percent: overridePercent, amount: allowed });
-      totalDistributedPercent += overridePercent;
-    }
-
-    // Always update previousPercent for the next calculation
-    // This ensures the override chain continues even if someone is capped
-    previousPercent = sponsorPercent;
-  }
-
-  // If total distributed is less than 100%, give the remaining to the highest rank sponsor
-  if (totalDistributedPercent < 100 && rankChain.length > 0) {
-    const highestRankSponsor = rankChain[rankChain.length - 1]; // last in sorted array (highest %)
-    const remainingPercent = 100 - totalDistributedPercent;
-    const rawReward = coreAmount * (remainingPercent / 100);
-    const { allowed } = await RewardCap.clampIncentive(highestRankSponsor.sponsorId, rawReward, trx);
-
-    if (allowed > 0) {
-      // Credit wallet
-      await trx('wallets')
-        .where({ user_id: highestRankSponsor.sponsorId, wallet_type: 'main' })
-        .increment('balance', allowed);
-
-      // Record transaction
-      await trx('transactions').insert({
-        user_id: highestRankSponsor.sponsorId,
-        wallet_type: 'main',
-        transaction_type: 'power_passup',
-        reference_type: 'stake_reward',
-        reference_id: referenceId?.toString?.() || String(referenceId),
-        amount: allowed,
-        currency: 'USD',
-        status: 'completed',
-        description: `Power Pass-Up from ${originUserName} (${remainingPercent}% remaining)`,
-        created_at: trx.fn.now(),
-        updated_at: trx.fn.now()
+      allocations.push({
+        sponsorId,
+        percent: overridePercent,
+        amount: allowed
       });
-
-      allocations.push({ sponsorId: highestRankSponsor.sponsorId, percent: remainingPercent, amount: allowed });
     }
+
+    // Update baseline for next sponsor
+    previousRankPercent = sponsorRankPercent;
   }
 
   const distributed = allocations.reduce((s, a) => s + a.amount, 0);
@@ -153,4 +125,3 @@ module.exports = {
   getSponsorChain,
   RANKS
 };
-
