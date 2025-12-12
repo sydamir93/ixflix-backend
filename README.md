@@ -30,6 +30,9 @@ Node/Express + Knex backend for wallets, staking, genealogy, rewards, and IXFLIX
 5) Seed (ranks default): `npx knex seed:run --specific=seed_ranks.js`
 6) Run: `npm start` (or `npm run dev`)
 
+### Environment Variables
+- `WITHDRAWALS_ENABLED`: Set to `false` to disable all withdrawal requests (returns 503 Service Unavailable)
+
 ### Notes
 - Combined incentive cap enforced across Catalyst + Synergy + Power Pass-Up per active pack tier.
 - Catalyst requires upline to have an active pack; payouts are cap-clamped.

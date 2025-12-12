@@ -9,6 +9,15 @@ const { logger } = require("../utils/logger");
 // Withdraw via NowPayments payout
 const initiateWithdraw = async (req, res) => {
   try {
+    // Check if withdrawals are disabled
+    const withdrawalsEnabled = process.env.WITHDRAWALS_ENABLED !== "false";
+    if (!withdrawalsEnabled) {
+      return res.status(503).json({
+        status: "ERROR",
+        message: "Withdrawals are currently disabled",
+      });
+    }
+
     const userId = req.user.id;
     const { amount, address, payoutCurrency = "usdtbsc" } = req.body;
 
@@ -401,11 +410,14 @@ const getWalletConfig = async (_req, res) => {
     Number.isNaN(withdrawFeePercentRaw) ? 0 : withdrawFeePercentRaw
   );
 
+  const withdrawalsEnabled = process.env.WITHDRAWALS_ENABLED !== "false";
+
   return res.status(200).json({
     status: "SUCCESS",
     data: {
       transferFeeAmount,
       withdrawFeePercent,
+      withdrawalsEnabled,
       transferFeePercent: 0, // backward compatibility with older clients expecting percent
     },
   });
