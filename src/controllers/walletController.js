@@ -601,6 +601,61 @@ const handleDepositCallback = async (req, res) => {
   }
 };
 
+// Get potential Power Pass-Up bonuses from pending downline rewards
+const getPotentialPowerPassUp = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { calculatePotentialPowerPassUp } = require('../models/PowerPassUp');
+
+    const potentialData = await calculatePotentialPowerPassUp(userId);
+
+    res.json({
+      status: 'SUCCESS',
+      data: {
+        potentialBonuses: potentialData.potentialBonuses,
+        pendingRewardsCount: potentialData.pendingRewards,
+        bonusDetails: potentialData.bonusDetails,
+        downlinePendingBreakdown: potentialData.downlinePendingBreakdown,
+        message: `You have $${potentialData.potentialBonuses.toFixed(2)} in potential Power Pass-Up bonuses from ${potentialData.pendingRewards} pending downline rewards`
+      }
+    });
+
+  } catch (error) {
+    logger.error('Error calculating potential Power Pass-Up:', error);
+    res.status(500).json({
+      status: 'ERROR',
+      message: 'Failed to calculate potential Power Pass-Up bonuses'
+    });
+  }
+};
+
+// Get potential Power Pass-Up bonuses user will RECEIVE when claiming their own pending rewards
+const getPotentialReceivedPowerPassUp = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { calculatePotentialReceivedPowerPassUp } = require('../models/PowerPassUp');
+
+    const receivedData = await calculatePotentialReceivedPowerPassUp(userId);
+
+    res.json({
+      status: 'SUCCESS',
+      data: {
+        potentialReceivedBonuses: receivedData.potentialReceivedBonuses,
+        pendingRewardsCount: receivedData.pendingRewardsCount,
+        receivedDetails: receivedData.receivedDetails,
+        message: `You will receive $${receivedData.potentialReceivedBonuses.toFixed(2)} in Power Pass-Up bonuses when you claim your ${receivedData.pendingRewardsCount} pending rewards`
+      }
+    });
+
+  } catch (error) {
+    logger.error('Error calculating potential received Power Pass-Up:', error);
+    res.status(500).json({
+      status: 'ERROR',
+      message: 'Failed to calculate potential received Power Pass-Up bonuses'
+    });
+  }
+};
+
 module.exports = {
   getBalance,
   getTransactionHistory,
@@ -610,5 +665,7 @@ module.exports = {
   transferToUser,
   initiateDeposit,
   handleDepositCallback,
-  initiateWithdraw
+  initiateWithdraw,
+  getPotentialPowerPassUp,
+  getPotentialReceivedPowerPassUp
 };

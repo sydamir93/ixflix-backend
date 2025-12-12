@@ -27,6 +27,12 @@ router.get('/config', walletController.getWalletConfig);
 // Incentive summary (caps + totals)
 router.get('/incentives/summary', walletController.getIncentiveSummary);
 
+// Potential Power Pass-Up bonuses from pending downline rewards
+router.get('/power-passup/potential', walletController.getPotentialPowerPassUp);
+
+// Potential Power Pass-Up bonuses user will receive from their own pending rewards
+router.get('/power-passup/potential-received', walletController.getPotentialReceivedPowerPassUp);
+
 // Initiate deposit
 router.post('/deposit', walletController.initiateDeposit);
 
