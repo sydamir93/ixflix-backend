@@ -754,6 +754,184 @@ async function buildPairingTree(rootUserId, maxDepth = 10, currentDepth = 0, vis
   return node;
 }
 
+// Admin: list manual deposits with user info
+const listManualDeposits = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || DEFAULT_PAGE_SIZE;
+    const offset = (page - 1) * limit;
+    const { status, user_id: userId, search } = req.query;
+
+    const baseQuery = db('transactions as t')
+      .join('users as u', 't.user_id', 'u.id')
+      .where('t.reference_type', 'manual_deposit');
+
+    if (status) {
+      baseQuery.andWhere('t.status', status);
+    }
+
+    if (userId) {
+      baseQuery.andWhere('t.user_id', userId);
+    }
+
+    if (search) {
+      baseQuery.andWhere((qb) => {
+        qb.where('u.phone_number', 'like', `%${search}%`)
+          .orWhere('u.email', 'like', `%${search}%`)
+          .orWhere('u.name', 'like', `%${search}%`);
+      });
+    }
+
+    const [rows, [{ count }]] = await Promise.all([
+      baseQuery
+        .clone()
+        .select(
+          't.*',
+          'u.name as user_name',
+          'u.email as user_email',
+          'u.phone_number as user_phone'
+        )
+        .orderBy('t.created_at', 'desc')
+        .limit(limit)
+        .offset(offset),
+      baseQuery.clone().count('* as count')
+    ]);
+
+    const transactions = rows.map((row) => ({
+      ...row,
+      metadata: parseMetadata(row.metadata)
+    }));
+
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        deposits: transactions,
+        pagination: {
+          page,
+          limit,
+          total: parseInt(count, 10) || 0,
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('List manual deposits (admin) failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch manual deposits' });
+  }
+};
+
+// Admin: process manual deposit (approve/reject)
+const processManualDepositAdmin = async (req, res) => {
+  try {
+    const { transaction_id } = req.params;
+    const { action, admin_note } = req.body;
+
+    if (!action || !['approve', 'reject'].includes(action)) {
+      return res.status(400).json({
+        status: 'ERROR',
+        message: 'Invalid action. Must be "approve" or "reject"'
+      });
+    }
+
+    // Find transaction
+    const transaction = await db('transactions').where('id', transaction_id).first();
+    if (!transaction) {
+      return res.status(404).json({
+        status: 'ERROR',
+        message: 'Transaction not found'
+      });
+    }
+
+    if (transaction.reference_type !== 'manual_deposit') {
+      return res.status(400).json({
+        status: 'ERROR',
+        message: 'This is not a manual deposit transaction'
+      });
+    }
+
+    if (transaction.status !== 'pending') {
+      return res.status(400).json({
+        status: 'ERROR',
+        message: `Transaction has already been ${transaction.status}`
+      });
+    }
+
+    // Helper to safely parse metadata
+    const existingMetadata = parseMetadata(transaction.metadata);
+
+    if (action === 'approve') {
+      // Use database transaction for atomicity
+      await db.transaction(async (trx) => {
+        // Update transaction status to completed
+        await trx('transactions')
+          .where('id', transaction_id)
+          .update({
+            status: 'completed',
+            metadata: JSON.stringify({
+              ...existingMetadata,
+              approved_at: new Date().toISOString(),
+              approved_by: req.user.id,
+              admin_note: admin_note || null
+            }),
+            updated_at: trx.fn.now()
+          });
+
+        // Update wallet balance
+        await Wallet.updateBalance(transaction.user_id, parseFloat(transaction.amount), 'add', 'main', trx);
+      });
+
+      logger.info('Admin approved manual deposit', {
+        adminId: req.user.id,
+        transactionId: transaction_id,
+        userId: transaction.user_id,
+        amount: transaction.amount
+      });
+
+      return res.json({
+        status: 'SUCCESS',
+        message: 'Manual deposit approved and wallet credited',
+        data: {
+          transaction_id: transaction_id,
+          user_id: transaction.user_id,
+          amount: transaction.amount
+        }
+      });
+    } else {
+      // Reject the transaction
+      await db('transactions')
+        .where('id', transaction_id)
+        .update({
+          status: 'rejected',
+          metadata: JSON.stringify({
+            ...existingMetadata,
+            rejected_at: new Date().toISOString(),
+            rejected_by: req.user.id,
+            admin_note: admin_note || null
+          }),
+          updated_at: db.fn.now()
+        });
+
+      logger.info('Admin rejected manual deposit', {
+        adminId: req.user.id,
+        transactionId: transaction_id,
+        userId: transaction.user_id,
+        amount: transaction.amount
+      });
+
+      return res.json({
+        status: 'SUCCESS',
+        message: 'Manual deposit rejected',
+        data: {
+          transaction_id: transaction_id
+        }
+      });
+    }
+  } catch (error) {
+    logger.error('Process manual deposit (admin) failed', { error: error.message, stack: error.stack });
+    return res.status(500).json({ status: 'ERROR', message: 'Failed to process manual deposit' });
+  }
+};
+
 module.exports = {
   listUsers,
   listStakes,
@@ -767,7 +945,9 @@ module.exports = {
   getNowPaymentsBalance,
   requeryDepositStatus,
   requeryWithdrawalStatus,
-  getPairingGenealogy
+  getPairingGenealogy,
+  listManualDeposits,
+  processManualDepositAdmin
 };
 
 

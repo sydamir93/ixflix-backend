@@ -36,6 +36,9 @@ router.get('/power-passup/potential-received', walletController.getPotentialRece
 // Initiate deposit
 router.post('/deposit', walletController.initiateDeposit);
 
+// Submit manual deposit
+router.post('/deposit/manual', walletController.submitManualDeposit);
+
 // Initiate withdrawal via NowPayments payout
 router.post('/withdraw', walletController.initiateWithdraw);
 

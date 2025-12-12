@@ -20,6 +20,15 @@ router.get('/stakes', adminController.listStakes);
 router.get('/deposits', adminController.listDeposits);
 router.post('/deposits/:transactionId/requery', adminController.requeryDepositStatus);
 
+// Manual Deposits
+router.get('/manual-deposits', adminController.listManualDeposits);
+router.post('/manual-deposits/:transaction_id/process', adminController.processManualDepositAdmin);
+
+// Alternative route using wallet controller (for backward compatibility)
+const walletController = require('../controllers/walletController');
+router.get('/wallet/manual-deposits', walletController.getPendingManualDeposits);
+router.post('/wallet/manual-deposits/:transaction_id/process', walletController.processManualDeposit);
+
 // Withdrawals
 router.get('/withdrawals', adminController.listWithdrawals);
 router.post('/withdrawals/:transactionId/requery', adminController.requeryWithdrawalStatus);
