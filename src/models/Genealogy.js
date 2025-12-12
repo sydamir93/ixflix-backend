@@ -95,18 +95,21 @@ class Genealogy {
         return { parentId: sponsorId, position: 'right' };
       }
 
-      // Both direct positions are filled, check sponsor's downline
-      const leftSubtreeDepth = await this.getSubtreeDepth(sponsorId, 'left');
-      const rightSubtreeDepth = await this.getSubtreeDepth(sponsorId, 'right');
+      // Both direct positions are filled, alternate between left and right subtrees
+      // Count how many users are already placed under this sponsor (excluding the 2 direct children)
+      const allDownlines = await this.getDownline(sponsorId);
+      const downlineCount = allDownlines.length - 2; // Subtract the 2 direct children
 
-      // Place in the subtree with lower depth (more balanced)
-      // If depths are equal, prefer left subtree
-      if (leftSubtreeDepth <= rightSubtreeDepth) {
-        // Find available position in left subtree
-        return await this.findAvailablePositionInSubtree(sponsorId, 'left');
+      // Alternate between left and right subtrees
+      // Even count (0, 2, 4...) = left subtree, Odd count (1, 3, 5...) = right subtree
+      const useLeftSubtree = (downlineCount % 2) === 0;
+
+      if (useLeftSubtree) {
+        // Find available position in left subtree using breadth-first search
+        return await this.findAvailablePositionBreadthFirst(sponsorId, 'left');
       } else {
-        // Find available position in right subtree
-        return await this.findAvailablePositionInSubtree(sponsorId, 'right');
+        // Find available position in right subtree using breadth-first search
+        return await this.findAvailablePositionBreadthFirst(sponsorId, 'right');
       }
     } catch (error) {
       console.error('Error getting next available position under sponsor:', error);
@@ -141,7 +144,60 @@ class Genealogy {
     }
   }
 
-  // Find available position in a specific subtree (recursive)
+  // Find available position in a specific subtree following the spine
+  // Left subtree always uses left positions, right subtree always uses right positions
+  static async findAvailablePositionBreadthFirst(sponsorId, subtreePosition) {
+    try {
+      // Get the root of the subtree (sponsor's child in the specified position)
+      const subtreeRoot = await db('genealogy')
+        .where('parent_id', sponsorId)
+        .where('position', subtreePosition)
+        .join('users', 'genealogy.user_id', 'users.id')
+        .select('genealogy.user_id as id')
+        .where('users.is_verified', true)
+        .first();
+
+      if (!subtreeRoot) {
+        // This shouldn't happen if we're calling this function, but handle it
+        return { parentId: sponsorId, position: subtreePosition };
+      }
+
+      // Follow the spine: left subtree uses left positions, right subtree uses right positions
+      // Traverse down the spine until we find an available position
+      let currentNodeId = subtreeRoot.id;
+      
+      while (true) {
+        // Check the position that matches the subtree side
+        const positionToCheck = subtreePosition; // 'left' for left subtree, 'right' for right subtree
+        const available = await this.isPositionAvailable(currentNodeId, positionToCheck);
+        
+        if (available) {
+          return { parentId: currentNodeId, position: positionToCheck };
+        }
+
+        // Position is taken, find the child in that position and continue down the spine
+        const child = await db('genealogy')
+          .where('parent_id', currentNodeId)
+          .where('position', positionToCheck)
+          .join('users', 'genealogy.user_id', 'users.id')
+          .select('genealogy.user_id as id')
+          .where('users.is_verified', true)
+          .first();
+
+        if (!child) {
+          // This shouldn't happen if position is not available, but handle it
+          return { parentId: currentNodeId, position: positionToCheck };
+        }
+
+        currentNodeId = child.id;
+      }
+    } catch (error) {
+      console.error('Error finding available position breadth-first:', error);
+      throw error;
+    }
+  }
+
+  // Find available position in a specific subtree (recursive) - kept for backward compatibility
   static async findAvailablePositionInSubtree(parentId, position) {
     try {
       // Find the child in the specified position

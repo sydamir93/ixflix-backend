@@ -17,3 +17,4 @@ exports.down = async function down(knex) {
     table.dropColumn('updated_at');
   });
 };
+
