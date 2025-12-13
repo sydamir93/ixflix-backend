@@ -1381,14 +1381,6 @@ const createFreeStake = async (req, res) => {
         updated_at: trx.fn.now(),
       });
 
-      // Distribute Catalyst Bonus up the referral chain (even for free stakes)
-      const catalystStats = await distributeCatalystBonus({
-        originUserId: user_id,
-        amount: numAmount,
-        referenceId: stake.id,
-        trx,
-      });
-
       // Add volume to Synergy Flow (binary) uplines
       await Synergy.addVolumeToUplines(user_id, numAmount, trx, true);
 
