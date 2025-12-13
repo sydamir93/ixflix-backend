@@ -14,18 +14,23 @@ const RANKS = {
   quantum: 100
 };
 
-// Get user rank percent based on live eligibility
-async function getUserRankPercent(userId) {
-  const Rank = require('./Rank');
-  const evalResult = await Rank.evaluateUserRank(userId);
+function unwrapRawRows(rawResult) {
+  // MySQL2 via Knex returns [rows, fields]
+  if (Array.isArray(rawResult)) return rawResult[0] || [];
+  // Postgres-style
+  if (rawResult && Array.isArray(rawResult.rows)) return rawResult.rows;
+  return rawResult || [];
+}
 
-  if (evalResult?.targetPercent) return Number(evalResult.targetPercent);
+// Get user rank percent (fast path from stored user_ranks)
+async function getUserRankPercent(userId, trx = db) {
+  const row = await trx('user_ranks')
+    .where({ user_id: userId })
+    .select('override_percent')
+    .first();
 
-  if (evalResult?.targetRank && RANKS[evalResult.targetRank] !== undefined) {
-    return RANKS[evalResult.targetRank];
-  }
-
-  return 0;
+  const pct = Number(row?.override_percent || 0);
+  return isFinite(pct) ? pct : 0;
 }
 
 // Fetch upline chain (max 9 levels)
@@ -44,6 +49,81 @@ async function getSponsorChain(userId, maxLevels = 9) {
   }
 
   return chain;
+}
+
+async function buildSponsorPointerMap(seedUserIds, maxLevels = 9, trx = db) {
+  const sponsorByUserId = new Map(); // user_id -> sponsor_id|null
+  const seen = new Set();
+  let frontier = new Set((seedUserIds || []).map((id) => Number(id)).filter(Boolean));
+
+  for (let level = 0; level < maxLevels && frontier.size > 0; level++) {
+    const ids = Array.from(frontier).filter((id) => !seen.has(id));
+    frontier = new Set();
+    if (ids.length === 0) break;
+
+    ids.forEach((id) => seen.add(id));
+
+    const rows = await trx('genealogy')
+      .whereIn('user_id', ids)
+      .select('user_id', 'sponsor_id');
+
+    for (const r of rows) {
+      const uid = Number(r.user_id);
+      const sid = r.sponsor_id ? Number(r.sponsor_id) : null;
+      sponsorByUserId.set(uid, sid);
+      if (sid && !seen.has(sid)) frontier.add(sid);
+    }
+  }
+
+  return sponsorByUserId;
+}
+
+function getSponsorChainFromMap(originUserId, sponsorByUserId, maxLevels = 9) {
+  const chain = [];
+  const visited = new Set();
+  let current = Number(originUserId);
+  for (let i = 0; i < maxLevels; i++) {
+    const sponsorId = sponsorByUserId.get(current);
+    if (!sponsorId || visited.has(sponsorId)) break;
+    chain.push(sponsorId);
+    visited.add(sponsorId);
+    current = sponsorId;
+  }
+  return chain;
+}
+
+async function buildRankPercentMap(userIds, trx = db) {
+  const ids = Array.from(new Set((userIds || []).map((id) => Number(id)).filter(Boolean)));
+  if (ids.length === 0) return new Map();
+
+  const rows = await trx('user_ranks')
+    .whereIn('user_id', ids)
+    .select('user_id', 'override_percent');
+
+  const map = new Map();
+  for (const r of rows) {
+    const pct = Number(r.override_percent || 0);
+    map.set(Number(r.user_id), isFinite(pct) ? pct : 0);
+  }
+  return map;
+}
+
+function computeOverridePercentForTarget(chain, targetUserId, rankPercentByUserId) {
+  const target = Number(targetUserId);
+  let previousRankPercent = 0;
+
+  for (const sponsorId of chain) {
+    const sponsorRankPercent = Number(rankPercentByUserId.get(sponsorId) || 0);
+    if (sponsorRankPercent <= previousRankPercent) continue;
+
+    const overridePercent = sponsorRankPercent - previousRankPercent;
+    if (sponsorId === target) {
+      return { percent: overridePercent, sponsorRankPercent, previousRankPercent };
+    }
+    previousRankPercent = sponsorRankPercent;
+  }
+
+  return { percent: 0, sponsorRankPercent: 0, previousRankPercent: 0 };
 }
 
 /**
@@ -67,7 +147,7 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
   let previousRankPercent = 0; // PDF-compliant: always start baseline at 0
 
   for (const sponsorId of chain) {
-    const sponsorRankPercent = await getUserRankPercent(sponsorId);
+    const sponsorRankPercent = await getUserRankPercent(sponsorId, trx);
 
     // Skip unranked or lower/equal rank sponsors
     if (sponsorRankPercent <= previousRankPercent) continue;
@@ -121,30 +201,51 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
 
 // Calculate potential Power Pass-Up bonuses from pending downline rewards
 async function calculatePotentialPowerPassUp(userId, trx = db) {
-  // Get all users in this user's downline (recursive)
-  const downlineUserIds = await getDownlineUserIds(userId);
+  // Pull pending rewards for full downline in one shot (recursive CTE)
+  const raw = await trx.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT user_id
+        FROM genealogy
+        WHERE sponsor_id = ?
 
-  if (downlineUserIds.length === 0) {
+        UNION ALL
+
+        SELECT g.user_id
+        FROM genealogy g
+        INNER JOIN downline d ON g.sponsor_id = d.user_id
+      )
+      SELECT
+        sr.id,
+        sr.reward_date,
+        sr.core_reward,
+        sr.harvest_reward,
+        sr.total_reward,
+        s.user_id AS staker_id,
+        u.name AS staker_name
+      FROM downline d
+      INNER JOIN stakes s
+        ON s.user_id = d.user_id
+       AND s.status = 'active'
+      INNER JOIN stake_rewards sr
+        ON sr.stake_id = s.id
+       AND sr.status = 'pending'
+      INNER JOIN users u
+        ON u.id = s.user_id
+    `,
+    [userId]
+  );
+
+  const pendingRewards = unwrapRawRows(raw);
+
+  if (!pendingRewards || pendingRewards.length === 0) {
     return {
       potentialBonuses: 0,
-      pendingRewards: [],
-      downlinePendingBreakdown: []
+      pendingRewards: 0,
+      bonusDetails: [],
+      downlinePendingBreakdown: [],
     };
   }
-
-  // Find all pending stake rewards for downline users with user details
-  const pendingRewards = await trx('stake_rewards')
-    .whereIn('stake_id', function() {
-      this.select('id').from('stakes').whereIn('user_id', downlineUserIds).where('stakes.status', 'active');
-    })
-    .where('stake_rewards.status', 'pending')
-    .select(
-      'stake_rewards.*',
-      'stakes.user_id as staker_id',
-      'users.name as staker_name'
-    )
-    .join('stakes', 'stake_rewards.stake_id', '=', 'stakes.id')
-    .join('users', 'stakes.user_id', '=', 'users.id');
 
   let totalPotentialBonus = 0;
   const bonusDetails = [];
@@ -170,34 +271,47 @@ async function calculatePotentialPowerPassUp(userId, trx = db) {
     stakerRewards[reward.staker_id].totalRewards += parseFloat(reward.total_reward);
   }
 
-  // Calculate potential Power Pass-Up for each staker's rewards
-  for (const stakerId of Object.keys(stakerRewards)) {
+  const stakerIds = Object.keys(stakerRewards).map((id) => Number(id));
+
+  // Build sponsor pointers and rank map in batches (no per-reward DB calls)
+  const sponsorByUserId = await buildSponsorPointerMap(stakerIds, 9, trx);
+  const sponsorUniverse = new Set();
+  for (const v of sponsorByUserId.values()) {
+    if (v) sponsorUniverse.add(v);
+  }
+  // Include the stakers themselves (some may not have rows in user_ranks yet)
+  stakerIds.forEach((id) => sponsorUniverse.add(id));
+  sponsorUniverse.add(Number(userId));
+
+  const rankPercentByUserId = await buildRankPercentMap(Array.from(sponsorUniverse), trx);
+
+  // Calculate potential Power Pass-Up for each staker's rewards (percent is constant per staker)
+  for (const stakerId of stakerIds) {
     const stakerData = stakerRewards[stakerId];
+    const chain = getSponsorChainFromMap(stakerId, sponsorByUserId, 9);
+    const { percent: userOverridePercent } = computeOverridePercentForTarget(
+      chain,
+      userId,
+      rankPercentByUserId
+    );
+
+    if (userOverridePercent <= 0) continue;
+
     let stakerPotentialBonus = 0;
-
-    // Calculate bonus for each reward this staker has
     for (const reward of stakerData.rewards) {
-      // Simulate Power Pass-Up distribution for this reward
-      const simulationResult = await simulatePowerPassUp({
-        originUserId: parseInt(stakerId),
-        coreAmount: parseFloat(reward.core_reward),
-        referenceId: `potential-${reward.id}`,
-        trx
-      });
+      const coreReward = parseFloat(reward.core_reward);
+      const bonusAmount = (userOverridePercent / 100) * coreReward;
+      if (bonusAmount <= 0) continue;
 
-      // Find the bonus amount for the current user
-      const userBonus = simulationResult.allocations.find(a => a.sponsorId === userId);
-      if (userBonus) {
-        stakerPotentialBonus += userBonus.amount;
-        bonusDetails.push({
-          rewardId: reward.id,
-          stakerId: parseInt(stakerId),
-          coreReward: parseFloat(reward.core_reward),
-          bonusAmount: userBonus.amount,
-          bonusPercent: userBonus.percent,
-          rewardDate: reward.reward_date
-        });
-      }
+      stakerPotentialBonus += bonusAmount;
+      bonusDetails.push({
+        rewardId: reward.id,
+        stakerId: Number(stakerId),
+        coreReward,
+        bonusAmount,
+        bonusPercent: userOverridePercent,
+        rewardDate: reward.reward_date
+      });
     }
 
     // Add to breakdown if they have potential bonuses
@@ -231,30 +345,51 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
     .select('stake_rewards.*')
     .join('stakes', 'stake_rewards.stake_id', '=', 'stakes.id');
 
+  if (!userPendingRewards || userPendingRewards.length === 0) {
+    return {
+      potentialReceivedBonuses: 0,
+      pendingRewardsCount: 0,
+      receivedDetails: [],
+    };
+  }
+
+  // Build upline info once for the user
+  const sponsorByUserId = await buildSponsorPointerMap([userId], 9, trx);
+  const chain = getSponsorChainFromMap(userId, sponsorByUserId, 9);
+  const rankPercentByUserId = await buildRankPercentMap(chain, trx);
+
   let totalPotentialReceived = 0;
   const receivedDetails = [];
 
   // Calculate potential Power Pass-Up bonuses user would receive for each of their pending rewards
   for (const reward of userPendingRewards) {
-    // Simulate Power Pass-Up distribution for this reward (as if it were being claimed)
-    const simulationResult = await simulatePowerPassUp({
-      originUserId: userId,
-      coreAmount: parseFloat(reward.core_reward),
-      referenceId: `potential-receive-${reward.id}`,
-      trx
-    });
+    const coreAmount = parseFloat(reward.core_reward);
+    if (!coreAmount || coreAmount <= 0) continue;
 
-    // Sum all bonuses the user would receive (from all their upline sponsors)
-    const userReceivedBonuses = simulationResult.allocations.filter(a => a.sponsorId !== userId); // Exclude self if any
-    const totalForThisReward = userReceivedBonuses.reduce((sum, a) => sum + a.amount, 0);
+    // Simulate allocations using cached chain + rank percents (no DB calls)
+    const allocations = [];
+    let previousRankPercent = 0;
+
+    for (const sponsorId of chain) {
+      const sponsorRankPercent = Number(rankPercentByUserId.get(sponsorId) || 0);
+      if (sponsorRankPercent <= previousRankPercent) continue;
+      const overridePercent = sponsorRankPercent - previousRankPercent;
+      const amount = (overridePercent / 100) * coreAmount;
+      if (amount > 0) {
+        allocations.push({ sponsorId, percent: overridePercent, amount });
+      }
+      previousRankPercent = sponsorRankPercent;
+    }
+
+    const totalForThisReward = allocations.reduce((sum, a) => sum + a.amount, 0);
 
     if (totalForThisReward > 0) {
       totalPotentialReceived += totalForThisReward;
       receivedDetails.push({
         rewardId: reward.id,
-        coreReward: parseFloat(reward.core_reward),
+        coreReward: coreAmount,
         totalBonuses: totalForThisReward,
-        bonusBreakdown: userReceivedBonuses,
+        bonusBreakdown: allocations,
         rewardDate: reward.reward_date
       });
     }
@@ -267,33 +402,6 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
   };
 }
 
-// Helper function to get all downline user IDs recursively
-async function getDownlineUserIds(userId, trx = db) {
-  const downlineIds = new Set();
-  const queue = [userId];
-
-  while (queue.length > 0) {
-    const currentUserId = queue.shift();
-
-    // Get direct children
-    const children = await trx('genealogy')
-      .where('sponsor_id', currentUserId)
-      .select('user_id');
-
-    for (const child of children) {
-      if (!downlineIds.has(child.user_id)) {
-        downlineIds.add(child.user_id);
-        queue.push(child.user_id);
-      }
-    }
-  }
-
-  // Remove the original user from downline
-  downlineIds.delete(userId);
-
-  return Array.from(downlineIds);
-}
-
 // Simulate Power Pass-Up distribution without actually crediting (for potential calculations)
 async function simulatePowerPassUp({ originUserId, coreAmount, referenceId, trx = db }) {
   if (!coreAmount || coreAmount <= 0) return { distributed: 0, allocations: [] };
@@ -304,7 +412,7 @@ async function simulatePowerPassUp({ originUserId, coreAmount, referenceId, trx 
   let previousRankPercent = 0; // PDF-compliant: always start at 0
 
   for (const sponsorId of chain) {
-    const sponsorRankPercent = await getUserRankPercent(sponsorId);
+    const sponsorRankPercent = await getUserRankPercent(sponsorId, trx);
 
     // Skip unranked or lower/equal rank sponsors
     if (sponsorRankPercent <= previousRankPercent) continue;
