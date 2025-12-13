@@ -156,27 +156,83 @@ class Stake {
 
   // Get highest active pack type and total active amount for a user
   static async getUserActivePackInfo(userId) {
-    const stakes = await db('stakes')
-      .where({ user_id: userId, status: 'active' });
+    // Prefer a single aggregate query to avoid loading all rows and doing JS scans.
+    const row = await db('stakes')
+      .where({ user_id: userId, status: 'active' })
+      .select(
+        db.raw('COALESCE(SUM(amount), 0) as total_amount'),
+        db.raw(`
+          COALESCE(
+            MAX(
+              CASE pack_type
+                WHEN 'quantum' THEN 4
+                WHEN 'charge' THEN 3
+                WHEN 'pulse' THEN 2
+                WHEN 'spark' THEN 1
+                ELSE 0
+              END
+            ),
+            0
+          ) as max_priority
+        `)
+      )
+      .first();
 
-    if (!stakes || stakes.length === 0) {
-      return { highestPack: null, totalAmount: 0 };
-    }
-
-    // Determine highest pack by priority: quantum > charge > pulse > spark
-    const priority = { quantum: 4, charge: 3, pulse: 2, spark: 1 };
-    let highestPack = null;
-    let totalAmount = 0;
-
-    stakes.forEach((s) => {
-      totalAmount += Number(s.amount || 0);
-      const p = priority[s.pack_type] || 0;
-      if (!highestPack || p > (priority[highestPack] || 0)) {
-        highestPack = s.pack_type;
-      }
-    });
+    const totalAmount = Number(row?.total_amount || 0);
+    const maxPriority = Number(row?.max_priority || 0);
+    const highestPack =
+      maxPriority === 4 ? 'quantum' :
+      maxPriority === 3 ? 'charge' :
+      maxPriority === 2 ? 'pulse' :
+      maxPriority === 1 ? 'spark' :
+      null;
 
     return { highestPack, totalAmount };
+  }
+
+  // Batch version of getUserActivePackInfo (for tree endpoints, admin lists, etc.)
+  static async getUsersActivePackInfo(userIds, trx = null) {
+    const query = trx || db;
+    const ids = Array.from(new Set((userIds || []).map((id) => Number(id)).filter(Boolean)));
+    const map = new Map();
+    if (ids.length === 0) return map;
+
+    const rows = await query('stakes')
+      .whereIn('user_id', ids)
+      .where({ status: 'active' })
+      .groupBy('user_id')
+      .select(
+        'user_id',
+        query.raw('COALESCE(SUM(amount), 0) as total_amount'),
+        query.raw(`
+          COALESCE(
+            MAX(
+              CASE pack_type
+                WHEN 'quantum' THEN 4
+                WHEN 'charge' THEN 3
+                WHEN 'pulse' THEN 2
+                WHEN 'spark' THEN 1
+                ELSE 0
+              END
+            ),
+            0
+          ) as max_priority
+        `)
+      );
+
+    for (const r of rows) {
+      const totalAmount = Number(r.total_amount || 0);
+      const maxPriority = Number(r.max_priority || 0);
+      const highestPack =
+        maxPriority === 4 ? 'quantum' :
+        maxPriority === 3 ? 'charge' :
+        maxPriority === 2 ? 'pulse' :
+        maxPriority === 1 ? 'spark' :
+        null;
+      map.set(Number(r.user_id), { highestPack, totalAmount });
+    }
+
+    return map;
   }
 
   // Get user's active stakes summary

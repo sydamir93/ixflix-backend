@@ -20,7 +20,15 @@ class Genealogy {
     try {
       const genealogies = await db('genealogy')
         .where('parent_id', parentId)
-        .select('*');
+        .select(
+          'id',
+          'user_id',
+          'parent_id',
+          'sponsor_id',
+          'position',
+          'created_at',
+          'updated_at'
+        );
 
       return genealogies;
     } catch (error) {
@@ -34,7 +42,15 @@ class Genealogy {
     try {
       const genealogies = await db('genealogy')
         .where('sponsor_id', sponsorId)
-        .select('*');
+        .select(
+          'id',
+          'user_id',
+          'parent_id',
+          'sponsor_id',
+          'position',
+          'created_at',
+          'updated_at'
+        );
 
       return genealogies;
     } catch (error) {
@@ -322,43 +338,61 @@ class Genealogy {
   // Get user's downline (all descendants)
   static async getDownline(userId, level = null) {
     try {
-      // This is a recursive query to get all descendants
-      // For simplicity, we'll implement a basic version
-      // In a real application, you might want to use a recursive CTE or cache this data
+      // Recursive CTE version (avoids N+1 loops).
+      const maxDepth = level === null ? null : Number(level);
 
-      const downline = [];
-      const queue = [{ id: userId, level: 0 }];
+      const raw = await db.raw(
+        `
+          WITH RECURSIVE downline AS (
+            SELECT
+              g.id,
+              g.user_id,
+              g.parent_id,
+              g.sponsor_id,
+              g.position,
+              g.created_at,
+              g.updated_at,
+              1 AS level
+            FROM genealogy g
+            WHERE g.parent_id = ?
 
-      while (queue.length > 0) {
-        const current = queue.shift();
+            UNION ALL
 
-        if (level !== null && current.level >= level) {
-          continue;
-        }
+            SELECT
+              g.id,
+              g.user_id,
+              g.parent_id,
+              g.sponsor_id,
+              g.position,
+              g.created_at,
+              g.updated_at,
+              d.level + 1 AS level
+            FROM genealogy g
+            INNER JOIN downline d ON g.parent_id = d.user_id
+            ${maxDepth ? 'WHERE d.level < ?' : ''}
+          )
+          SELECT
+            d.id,
+            d.user_id,
+            d.parent_id,
+            d.sponsor_id,
+            d.position,
+            d.created_at,
+            d.updated_at,
+            d.level,
+            u.email,
+            u.name,
+            u.created_at AS user_created_at
+          FROM downline d
+          INNER JOIN users u ON u.id = d.user_id
+          ORDER BY d.level ASC, d.created_at ASC
+        `,
+        maxDepth ? [userId, maxDepth] : [userId]
+      );
 
-        const children = await db('genealogy')
-          .where('parent_id', current.id)
-          .join('users', 'genealogy.user_id', 'users.id')
-          .select(
-            'genealogy.*',
-            'users.email',
-            'users.name',
-            'users.created_at as user_created_at'
-          );
-
-        for (const child of children) {
-          downline.push({
-            ...child,
-            level: current.level + 1
-          });
-
-          if (level === null || current.level + 1 < level) {
-            queue.push({ id: child.user_id, level: current.level + 1 });
-          }
-        }
-      }
-
-      return downline;
+      // MySQL2 via Knex returns [rows, fields]
+      const rows = Array.isArray(raw) ? (raw[0] || []) : (raw?.rows || []);
+      return rows;
     } catch (error) {
       console.error('Error getting downline:', error);
       throw error;
@@ -368,33 +402,55 @@ class Genealogy {
   // Get user's upline (ancestors)
   static async getUpline(userId, levels = null) {
     try {
-      const upline = [];
-      let currentUserId = userId;
-      let currentLevel = 0;
+      // Recursive CTE version (avoids per-level queries).
+      const maxLevels = levels === null ? null : Number(levels);
 
-      while (currentUserId && (levels === null || currentLevel < levels)) {
-        const genealogy = await db('genealogy')
-          .where('user_id', currentUserId)
-          .join('users', 'genealogy.parent_id', 'users.id')
-          .select(
-            'genealogy.*',
-            'users.email as parent_email',
-            'users.name as parent_name'
+      const raw = await db.raw(
+        `
+          WITH RECURSIVE upline AS (
+            SELECT
+              g.id,
+              g.user_id,
+              g.parent_id,
+              g.sponsor_id,
+              g.position,
+              g.created_at,
+              g.updated_at,
+              0 AS level
+            FROM genealogy g
+            WHERE g.user_id = ?
+              AND g.parent_id IS NOT NULL
+
+            UNION ALL
+
+            SELECT
+              g.id,
+              g.user_id,
+              g.parent_id,
+              g.sponsor_id,
+              g.position,
+              g.created_at,
+              g.updated_at,
+              u.level + 1 AS level
+            FROM genealogy g
+            INNER JOIN upline u ON g.user_id = u.parent_id
+            WHERE g.parent_id IS NOT NULL
+              ${maxLevels ? 'AND u.level + 1 < ?' : ''}
           )
-          .first();
+          SELECT
+            u.*,
+            p.email AS parent_email,
+            p.name AS parent_name
+          FROM upline u
+          LEFT JOIN users p ON p.id = u.parent_id
+          ${maxLevels ? 'WHERE u.level < ?' : ''}
+          ORDER BY u.level ASC
+        `,
+        maxLevels ? [userId, maxLevels, maxLevels] : [userId]
+      );
 
-        if (!genealogy) break;
-
-        upline.push({
-          ...genealogy,
-          level: currentLevel
-        });
-
-        currentUserId = genealogy.parent_id;
-        currentLevel++;
-      }
-
-      return upline;
+      const rows = Array.isArray(raw) ? (raw[0] || []) : (raw?.rows || []);
+      return rows;
     } catch (error) {
       console.error('Error getting upline:', error);
       throw error;

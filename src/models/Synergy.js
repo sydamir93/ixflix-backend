@@ -25,18 +25,17 @@ class Synergy {
 
   // Eligibility: at least 1 active direct on left AND 1 active direct on right with an active stake
   static async hasActiveDirectOnSide(userId, side) {
-    const direct = await db('genealogy')
-      .join('users', 'genealogy.user_id', 'users.id')
-      .where({ parent_id: userId, position: side })
-      .andWhere('users.is_verified', true)
-      .select('users.id')
+    // Single query instead of "find direct" then "find stake" (N+1 in loops).
+    const row = await db('genealogy as g')
+      .join('users as u', 'g.user_id', 'u.id')
+      .join('stakes as s', 's.user_id', 'u.id')
+      .where({ 'g.parent_id': userId, 'g.position': side })
+      .andWhere('u.is_verified', true)
+      .andWhere('s.status', 'active')
+      .select('u.id')
       .first();
 
-    if (!direct) return false;
-    const stakes = await db('stakes')
-      .where({ user_id: direct.id, status: 'active' })
-      .first();
-    return !!stakes;
+    return !!row;
   }
 
   static async getEligibility(userId) {
@@ -54,17 +53,64 @@ class Synergy {
   // Add volume to uplines along binary parent chain, using child's position (left/right)
   static async addVolumeToUplines(userId, amount, trx = null) {
     const query = trx || db;
-    let currentChildId = userId;
 
-    // Traverse upwards
-    while (true) {
-      const node = await query('genealogy').where({ user_id: currentChildId }).first();
-      if (!node || !node.parent_id) break;
+    // Recursive CTE: fetch the full parent chain (child->parent) in one DB round trip.
+    const raw = await query.raw(
+      `
+        WITH RECURSIVE path AS (
+          SELECT
+            g.user_id AS child_id,
+            g.parent_id,
+            g.position,
+            0 AS lvl
+          FROM genealogy g
+          WHERE g.user_id = ?
 
-      const parentId = node.parent_id;
-      const position = node.position; // 'left' or 'right'
+          UNION ALL
 
-      await this.ensureVolumeRow(parentId, query);
+          SELECT
+            g.user_id AS child_id,
+            g.parent_id,
+            g.position,
+            path.lvl + 1 AS lvl
+          FROM genealogy g
+          INNER JOIN path ON g.user_id = path.parent_id
+          WHERE path.parent_id IS NOT NULL
+        )
+        SELECT parent_id, position
+        FROM path
+        WHERE parent_id IS NOT NULL
+        ORDER BY lvl ASC
+      `,
+      [userId]
+    );
+
+    const rows = Array.isArray(raw) ? (raw[0] || []) : (raw?.rows || []);
+    if (!rows.length) return;
+
+    // Ensure all parent volume rows exist (batch).
+    const parentIds = Array.from(
+      new Set(rows.map((r) => Number(r.parent_id)).filter(Boolean))
+    );
+
+    const existing = await query('team_volumes')
+      .whereIn('user_id', parentIds)
+      .select('user_id');
+    const existingSet = new Set(existing.map((r) => Number(r.user_id)));
+
+    const toInsert = parentIds
+      .filter((id) => !existingSet.has(id))
+      .map((id) => ({ user_id: id, created_at: query.fn.now(), updated_at: query.fn.now() }));
+
+    if (toInsert.length) {
+      await query('team_volumes').insert(toInsert);
+    }
+
+    // Apply increments (one update per ancestor; no extra reads).
+    for (const r of rows) {
+      const parentId = Number(r.parent_id);
+      const position = r.position;
+      if (!parentId) continue;
 
       if (position === 'left') {
         await query('team_volumes')
@@ -77,8 +123,6 @@ class Synergy {
           .increment('right_volume', amount)
           .update({ updated_at: query.fn.now() });
       }
-
-      currentChildId = parentId;
     }
   }
 

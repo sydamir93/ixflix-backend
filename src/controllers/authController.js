@@ -1208,21 +1208,30 @@ async function getCurrentUser(req, res) {
  * Count all downlines recursively
  */
 async function countAllDownlines(sponsorId, visited = new Set()) {
-  if (visited.has(sponsorId)) return 0; // Prevent infinite loops
-  visited.add(sponsorId);
+  // Keep signature for compatibility; ignore visited (CTE handles cycles via data integrity)
+  const raw = await db.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT user_id
+        FROM genealogy
+        WHERE sponsor_id = ?
+          AND user_id <> ?
 
-  const directDownlines = await db("genealogy")
-    .where({ sponsor_id: sponsorId })
-    .select("user_id");
+        UNION ALL
 
-  let totalCount = directDownlines.length;
+        SELECT g.user_id
+        FROM genealogy g
+        INNER JOIN downline d ON g.sponsor_id = d.user_id
+        WHERE g.user_id <> ?
+      )
+      SELECT COUNT(*) as count FROM downline
+    `,
+    [sponsorId, sponsorId, sponsorId]
+  );
 
-  // Recursively count downlines for each direct downline
-  for (const downline of directDownlines) {
-    totalCount += await countAllDownlines(downline.user_id, visited);
-  }
-
-  return totalCount;
+  // MySQL2 via Knex returns [rows, fields]
+  const rows = Array.isArray(raw) ? raw[0] : raw?.rows || [];
+  return Number(rows?.[0]?.count || 0);
 }
 
 /**
@@ -1278,63 +1287,99 @@ async function buildGenealogyTree(
   currentDepth = 0,
   visited = new Set()
 ) {
-  // Prevent cycles / self-references
-  if (visited.has(sponsorId)) return [];
-  visited.add(sponsorId);
+  // One-shot recursive CTE for the full sponsor tree, then build in-memory.
+  // This eliminates N+1 queries and per-node stake lookups.
+  const raw = await db.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT
+          g.user_id,
+          g.sponsor_id,
+          g.position,
+          g.created_at as joined_at
+        FROM genealogy g
+        WHERE g.sponsor_id = ?
+          AND g.user_id <> ?
 
-  // Get direct downlines for this sponsor
-  const downlines = await db("genealogy as g")
-    .join("users as u", "g.user_id", "u.id")
-    .leftJoin("user_ranks as r", "u.id", "r.user_id")
-    .where("g.sponsor_id", sponsorId)
-    .andWhereNot("g.user_id", sponsorId) // avoid self-linked seed rows
-    .select(
-      "u.id",
-      "u.name",
-      "u.email",
-      "u.phone_number",
-      "u.created_at",
-      "g.position",
-      "g.created_at as joined_at",
-      "r.rank",
-      "r.override_percent"
-    )
-    .orderBy("g.created_at", "desc");
+        UNION ALL
 
-  // Add stake information for each downline
-  const downlinesWithStakes = await Promise.all(
-    downlines.map(async (downline) => {
-      const stakeInfo = await Stake.getUserActivePackInfo(downline.id);
-      return {
-        ...downline,
+        SELECT
+          g.user_id,
+          g.sponsor_id,
+          g.position,
+          g.created_at as joined_at
+        FROM genealogy g
+        INNER JOIN downline d ON g.sponsor_id = d.user_id
+        WHERE g.user_id <> ?
+      )
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.phone_number,
+        u.created_at,
+        d.sponsor_id,
+        d.position,
+        d.joined_at,
+        r.rank,
+        r.override_percent
+      FROM downline d
+      INNER JOIN users u ON u.id = d.user_id
+      LEFT JOIN user_ranks r ON r.user_id = u.id
+    `,
+    [sponsorId, sponsorId, sponsorId]
+  );
+
+  const rows = Array.isArray(raw) ? raw[0] : raw?.rows || [];
+  if (!rows || rows.length === 0) return [];
+
+  const ids = rows.map((r) => Number(r.id)).filter(Boolean);
+  const stakeInfoByUserId = await Stake.getUsersActivePackInfo(ids);
+
+  const childrenBySponsorId = new Map();
+  for (const r of rows) {
+    const parent = Number(r.sponsor_id);
+    const arr = childrenBySponsorId.get(parent) || [];
+    arr.push(r);
+    childrenBySponsorId.set(parent, arr);
+  }
+
+  // Preserve previous behavior: newest join first
+  for (const [, arr] of childrenBySponsorId.entries()) {
+    arr.sort((a, b) => new Date(b.joined_at).getTime() - new Date(a.joined_at).getTime());
+  }
+
+  const build = (parentSponsorId, path = new Set()) => {
+    const children = childrenBySponsorId.get(Number(parentSponsorId)) || [];
+    const out = [];
+
+    for (const child of children) {
+      const id = Number(child.id);
+      if (!id || path.has(id)) continue;
+      const nextPath = new Set(path);
+      nextPath.add(id);
+
+      const stakeInfo = stakeInfoByUserId.get(id) || { highestPack: null, totalAmount: 0 };
+
+      out.push({
+        id,
+        name: child.name,
+        email: child.email,
+        phone_number: child.phone_number,
+        position: child.position,
+        joined_at: child.joined_at,
+        rank: child.rank || "unranked",
+        rank_percent: child.override_percent || 0,
         stake_pack: stakeInfo.highestPack,
         stake_amount: stakeInfo.totalAmount,
-      };
-    })
-  );
+        children: build(id, nextPath),
+      });
+    }
 
-  // Recursively build tree for each downline
-  const tree = await Promise.all(
-    downlinesWithStakes.map(async (downline) => ({
-      id: downline.id,
-      name: downline.name,
-      email: downline.email,
-      phone_number: downline.phone_number,
-      position: downline.position,
-      joined_at: downline.joined_at,
-      rank: downline.rank || "unranked",
-      rank_percent: downline.override_percent || 0,
-      stake_pack: downline.stake_pack,
-      stake_amount: downline.stake_amount,
-      children: await buildGenealogyTree(
-        downline.id,
-        currentDepth + 1,
-        new Set(visited)
-      ),
-    }))
-  );
+    return out;
+  };
 
-  return tree;
+  return build(sponsorId);
 }
 
 /**
@@ -1347,63 +1392,102 @@ async function buildPlacementTree(
   currentDepth = 0,
   visited = new Set()
 ) {
-  // Prevent cycles
-  if (visited.has(parentId)) return [];
-  visited.add(parentId);
+  // One-shot recursive CTE for the full placement (binary parent_id) tree, then build in-memory.
+  const raw = await db.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT
+          g.user_id,
+          g.parent_id,
+          g.position,
+          g.created_at as joined_at
+        FROM genealogy g
+        WHERE g.parent_id = ?
 
-  // Get direct children (left and right) for this parent
-  const children = await db("genealogy as g")
-    .join("users as u", "g.user_id", "u.id")
-    .leftJoin("user_ranks as r", "u.id", "r.user_id")
-    .where("g.parent_id", parentId)
-    .select(
-      "u.id",
-      "u.name",
-      "u.email",
-      "u.phone_number",
-      "u.created_at",
-      "g.position",
-      "g.created_at as joined_at",
-      "r.rank",
-      "r.override_percent"
-    )
-    .orderBy("g.position", "asc") // left before right
-    .orderBy("g.created_at", "asc");
+        UNION ALL
 
-  // Add stake information for each child
-  const childrenWithStakes = await Promise.all(
-    children.map(async (child) => {
-      const stakeInfo = await Stake.getUserActivePackInfo(child.id);
-      return {
-        ...child,
+        SELECT
+          g.user_id,
+          g.parent_id,
+          g.position,
+          g.created_at as joined_at
+        FROM genealogy g
+        INNER JOIN downline d ON g.parent_id = d.user_id
+      )
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.phone_number,
+        u.created_at,
+        d.parent_id,
+        d.position,
+        d.joined_at,
+        r.rank,
+        r.override_percent
+      FROM downline d
+      INNER JOIN users u ON u.id = d.user_id
+      LEFT JOIN user_ranks r ON r.user_id = u.id
+    `,
+    [parentId]
+  );
+
+  const rows = Array.isArray(raw) ? raw[0] : raw?.rows || [];
+  if (!rows || rows.length === 0) return [];
+
+  const ids = rows.map((r) => Number(r.id)).filter(Boolean);
+  const stakeInfoByUserId = await Stake.getUsersActivePackInfo(ids);
+
+  const childrenByParentId = new Map();
+  for (const r of rows) {
+    const parent = Number(r.parent_id);
+    const arr = childrenByParentId.get(parent) || [];
+    arr.push(r);
+    childrenByParentId.set(parent, arr);
+  }
+
+  // Preserve previous behavior: left before right, then older joins first
+  const posOrder = (p) => (p === 'left' ? 0 : p === 'right' ? 1 : 2);
+  for (const [, arr] of childrenByParentId.entries()) {
+    arr.sort((a, b) => {
+      const pa = posOrder(a.position);
+      const pb = posOrder(b.position);
+      if (pa !== pb) return pa - pb;
+      return new Date(a.joined_at).getTime() - new Date(b.joined_at).getTime();
+    });
+  }
+
+  const build = (pid, path = new Set()) => {
+    const children = childrenByParentId.get(Number(pid)) || [];
+    const out = [];
+
+    for (const child of children) {
+      const id = Number(child.id);
+      if (!id || path.has(id)) continue;
+      const nextPath = new Set(path);
+      nextPath.add(id);
+
+      const stakeInfo = stakeInfoByUserId.get(id) || { highestPack: null, totalAmount: 0 };
+
+      out.push({
+        id,
+        name: child.name,
+        email: child.email,
+        phone_number: child.phone_number,
+        position: child.position,
+        joined_at: child.joined_at,
+        rank: child.rank || "unranked",
+        rank_percent: child.override_percent || 0,
         stake_pack: stakeInfo.highestPack,
         stake_amount: stakeInfo.totalAmount,
-      };
-    })
-  );
+        children: build(id, nextPath),
+      });
+    }
 
-  // Recursively build tree for each child
-  const tree = await Promise.all(
-    childrenWithStakes.map(async (child) => ({
-      id: child.id,
-      name: child.name,
-      email: child.email,
-      phone_number: child.phone_number,
-      position: child.position,
-      joined_at: child.joined_at,
-      rank: child.rank || "unranked",
-      rank_percent: child.override_percent || 0,
-      stake_pack: child.stake_pack,
-      stake_amount: child.stake_amount,
-      children: await buildPlacementTree(
-        child.id,
-        currentDepth + 1,
-        new Set(visited)
-      ),
-    }))
-  );
+    return out;
+  };
 
-  return tree;
+  return build(parentId);
 }
 
 /**
