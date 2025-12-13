@@ -20,7 +20,15 @@ class Genealogy {
     try {
       const genealogies = await db('genealogy')
         .where('parent_id', parentId)
-        .select('*');
+        .select(
+          'id',
+          'user_id',
+          'parent_id',
+          'sponsor_id',
+          'position',
+          'created_at',
+          'updated_at'
+        );
 
       return genealogies;
     } catch (error) {
@@ -34,7 +42,15 @@ class Genealogy {
     try {
       const genealogies = await db('genealogy')
         .where('sponsor_id', sponsorId)
-        .select('*');
+        .select(
+          'id',
+          'user_id',
+          'parent_id',
+          'sponsor_id',
+          'position',
+          'created_at',
+          'updated_at'
+        );
 
       return genealogies;
     } catch (error) {

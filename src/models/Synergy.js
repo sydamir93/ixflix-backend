@@ -25,18 +25,17 @@ class Synergy {
 
   // Eligibility: at least 1 active direct on left AND 1 active direct on right with an active stake
   static async hasActiveDirectOnSide(userId, side) {
-    const direct = await db('genealogy')
-      .join('users', 'genealogy.user_id', 'users.id')
-      .where({ parent_id: userId, position: side })
-      .andWhere('users.is_verified', true)
-      .select('users.id')
+    // Single query instead of "find direct" then "find stake" (N+1 in loops).
+    const row = await db('genealogy as g')
+      .join('users as u', 'g.user_id', 'u.id')
+      .join('stakes as s', 's.user_id', 'u.id')
+      .where({ 'g.parent_id': userId, 'g.position': side })
+      .andWhere('u.is_verified', true)
+      .andWhere('s.status', 'active')
+      .select('u.id')
       .first();
 
-    if (!direct) return false;
-    const stakes = await db('stakes')
-      .where({ user_id: direct.id, status: 'active' })
-      .first();
-    return !!stakes;
+    return !!row;
   }
 
   static async getEligibility(userId) {
