@@ -1,17 +1,71 @@
-const db = require('../config/database');
-const Stake = require('./Stake');
+const db = require("../config/database");
+const Stake = require("./Stake");
 
 // Rank ladder aligned to Energy Spectrum (percent is Power Pass-Up override)
 const RANK_LADDER = [
-  { key: 'spark', minDirects: 1, minPackValue: 25, teamVolume: 1000, percent: 5 },
-  { key: 'pulse', minDirects: 2, minPackValue: 250, teamVolume: 5000, percent: 10 },
-  { key: 'charge', minDirects: 3, minPackValue: 500, teamVolume: 15000, percent: 15 },
-  { key: 'surge', minDirects: 4, minPackValue: 1000, teamVolume: 50000, percent: 25 },
-  { key: 'flux', minDirects: 5, minPackValue: 2500, teamVolume: 100000, percent: 40 },
-  { key: 'volt', minDirects: 6, minPackValue: 5000, teamVolume: 250000, percent: 55 },
-  { key: 'current', minDirects: 7, minPackValue: 10000, teamVolume: 500000, percent: 70 },
-  { key: 'magnet', minDirects: 8, minPackValue: 25000, teamVolume: 1000000, percent: 85 },
-  { key: 'quantum', minDirects: 9, minPackValue: 50000, teamVolume: 2000000, percent: 100 },
+  {
+    key: "spark",
+    minDirects: 1,
+    minPackValue: 25,
+    teamVolume: 1000,
+    percent: 5,
+  },
+  {
+    key: "pulse",
+    minDirects: 2,
+    minPackValue: 250,
+    teamVolume: 5000,
+    percent: 10,
+  },
+  {
+    key: "charge",
+    minDirects: 3,
+    minPackValue: 500,
+    teamVolume: 15000,
+    percent: 15,
+  },
+  {
+    key: "surge",
+    minDirects: 4,
+    minPackValue: 1000,
+    teamVolume: 50000,
+    percent: 25,
+  },
+  {
+    key: "flux",
+    minDirects: 5,
+    minPackValue: 2500,
+    teamVolume: 100000,
+    percent: 40,
+  },
+  {
+    key: "volt",
+    minDirects: 6,
+    minPackValue: 5000,
+    teamVolume: 250000,
+    percent: 55,
+  },
+  {
+    key: "current",
+    minDirects: 7,
+    minPackValue: 10000,
+    teamVolume: 500000,
+    percent: 70,
+  },
+  {
+    key: "magnet",
+    minDirects: 8,
+    minPackValue: 25000,
+    teamVolume: 1000000,
+    percent: 85,
+  },
+  {
+    key: "quantum",
+    minDirects: 9,
+    minPackValue: 50000,
+    teamVolume: 2000000,
+    percent: 100,
+  },
 ];
 
 function unwrapRawRows(rawResult) {
@@ -24,31 +78,34 @@ function unwrapRawRows(rawResult) {
 
 async function ensureRankRow(userId, trx = null) {
   const query = trx || db;
-  const existing = await query('user_ranks').where({ user_id: userId }).first();
+  const existing = await query("user_ranks").where({ user_id: userId }).first();
   if (existing) return existing;
 
-    try {
-      await query('user_ranks').insert({
-        user_id: userId,
-        rank: 'unranked',
-        override_percent: 0,
-        created_at: query.fn.now(),
-        updated_at: query.fn.now()
-      });
-      return await query('user_ranks').where({ user_id: userId }).first();
+  try {
+    await query("user_ranks").insert({
+      user_id: userId,
+      rank: "unranked",
+      override_percent: 0,
+      created_at: query.fn.now(),
+      updated_at: query.fn.now(),
+    });
+    return await query("user_ranks").where({ user_id: userId }).first();
   } catch (err) {
     // If another request inserted concurrently, return the existing row
-    if (err && (err.code === 'ER_DUP_ENTRY' || err.code === 'SQLITE_CONSTRAINT')) {
-      return await query('user_ranks').where({ user_id: userId }).first();
+    if (
+      err &&
+      (err.code === "ER_DUP_ENTRY" || err.code === "SQLITE_CONSTRAINT")
+    ) {
+      return await query("user_ranks").where({ user_id: userId }).first();
     }
     throw err;
   }
 }
 
 async function getDirectReferralsCount(userId) {
-  const row = await db('genealogy')
+  const row = await db("genealogy")
     .where({ sponsor_id: userId })
-    .count('id as count')
+    .count("id as count")
     .first();
   return parseInt(row?.count || 0);
 }
@@ -103,7 +160,9 @@ async function getTeamSalesVolume(userId) {
 }
 
 async function getHighestPackAmount(userId) {
-  const { highestPack, totalAmount } = await Stake.getUserActivePackInfo(userId);
+  const { highestPack, totalAmount } = await Stake.getUserActivePackInfo(
+    userId
+  );
   return { pack: highestPack, amount: totalAmount };
 }
 
@@ -128,8 +187,8 @@ function computeProgress(current, target) {
     remaining: {
       directs: Math.max(0, target.minDirects - current.directReferrals),
       packAmount: Math.max(0, target.minPackValue - current.packAmount),
-      teamVolume: Math.max(0, target.teamVolume - current.teamVolume)
-    }
+      teamVolume: Math.max(0, target.teamVolume - current.teamVolume),
+    },
   };
 }
 
@@ -155,7 +214,7 @@ async function evaluateUserRank(userId) {
     packAmount,
     teamVolume,
     targetRank: target ? target.key : null,
-    targetPercent: target ? target.percent : 0
+    targetPercent: target ? target.percent : 0,
   };
 }
 
@@ -167,7 +226,9 @@ async function getRankProgress(userId) {
 
   // Find next rank above current percent
   const ladderByPercent = RANK_LADDER.sort((a, b) => a.percent - b.percent);
-  const next = [...ladderByPercent].find((r) => r.percent > Number(current.override_percent || 0));
+  const next = [...ladderByPercent].find(
+    (r) => r.percent > Number(current.override_percent || 0)
+  );
 
   const progress = computeProgress(
     { directReferrals, packAmount, teamVolume },
@@ -182,22 +243,27 @@ async function getRankProgress(userId) {
     teamVolume,
     nextRank: progress.nextRank,
     progressPercent: progress.percent,
-    remaining: progress.remaining
+    remaining: progress.remaining,
   };
 }
 
-async function setUserRank(userId, rankKey, percentOverride = null, trx = null) {
+async function setUserRank(
+  userId,
+  rankKey,
+  percentOverride = null,
+  trx = null
+) {
   const query = trx || db;
-  const percent = percentOverride ?? (RANK_LADDER.find(r => r.key === rankKey)?.percent || 0);
+  const percent =
+    percentOverride ??
+    (RANK_LADDER.find((r) => r.key === rankKey)?.percent || 0);
   const row = await ensureRankRow(userId, query);
-  await query('user_ranks')
-    .where({ user_id: userId })
-    .update({
-      rank: rankKey,
-      override_percent: percent,
-      updated_at: query.fn.now()
-    });
-  const updated = await query('user_ranks').where({ user_id: userId }).first();
+  await query("user_ranks").where({ user_id: userId }).update({
+    rank: rankKey,
+    override_percent: percent,
+    updated_at: query.fn.now(),
+  });
+  const updated = await query("user_ranks").where({ user_id: userId }).first();
   return updated || row;
 }
 
@@ -206,40 +272,47 @@ async function autoPromoteUser(userId) {
   const evalResult = await evaluateUserRank(userId);
   const currentPercent = Number(current.override_percent || 0);
 
-  // No eligible rank
+  // No eligible rank - keep current rank
   if (!evalResult.targetRank) {
-    if (currentPercent > 0) {
-      const updated = await setUserRank(userId, 'unranked', 0);
-      return { promoted: false, demoted: true, rank: updated.rank, percent: updated.override_percent };
-    }
-    return { promoted: false, demoted: false, rank: current.rank, percent: current.override_percent };
+    return {
+      promoted: false,
+      demoted: false,
+      rank: current.rank,
+      percent: current.override_percent,
+    };
   }
 
-  // Demote if current > target
-  if (evalResult.targetPercent < currentPercent) {
-    const updated = await setUserRank(userId, evalResult.targetRank, evalResult.targetPercent);
-    return { promoted: false, demoted: true, rank: updated.rank, percent: updated.override_percent };
-  }
-
-  // Promote if target higher
+  // Promote if target higher (never demote)
   if (evalResult.targetPercent > currentPercent) {
-    const updated = await setUserRank(userId, evalResult.targetRank, evalResult.targetPercent);
-    return { promoted: true, demoted: false, rank: updated.rank, percent: updated.override_percent };
+    const updated = await setUserRank(
+      userId,
+      evalResult.targetRank,
+      evalResult.targetPercent
+    );
+    return {
+      promoted: true,
+      demoted: false,
+      rank: updated.rank,
+      percent: updated.override_percent,
+    };
   }
 
-  return { promoted: false, demoted: false, rank: current.rank, percent: current.override_percent };
+  return {
+    promoted: false,
+    demoted: false,
+    rank: current.rank,
+    percent: current.override_percent,
+  };
 }
 
 async function autoPromoteAll() {
-  const users = await db('users').select('id');
+  const users = await db("users").select("id");
   let promoted = 0;
-  let demoted = 0;
   for (const u of users) {
     const res = await autoPromoteUser(u.id);
     if (res.promoted) promoted++;
-    if (res.demoted) demoted++;
   }
-  return { users: users.length, promoted, demoted };
+  return { users: users.length, promoted };
 }
 
 module.exports = {
@@ -249,6 +322,5 @@ module.exports = {
   setUserRank,
   autoPromoteUser,
   autoPromoteAll,
-  getRankProgress
+  getRankProgress,
 };
-
