@@ -1,13 +1,15 @@
-const Stake = require('../models/Stake');
-const Wallet = require('../models/Wallet');
-const Transaction = require('../models/Transaction');
-const Synergy = require('../models/Synergy');
-const RewardCap = require('../models/RewardCap');
-const db = require('../config/database');
-const { getRankProgress } = require('../models/Rank');
+const Stake = require("../models/Stake");
+const Wallet = require("../models/Wallet");
+const Transaction = require("../models/Transaction");
+const Synergy = require("../models/Synergy");
+const RewardCap = require("../models/RewardCap");
+const db = require("../config/database");
+const { getRankProgress } = require("../models/Rank");
 
 // Catalyst Bonus percentages per level (up to 9 levels) from the reward plan
-const CATALYST_LEVEL_RATES = [0.09, 0.03, 0.01, 0.005, 0.005, 0.0025, 0.0025, 0.0025, 0.0025];
+const CATALYST_LEVEL_RATES = [
+  0.09, 0.03, 0.01, 0.005, 0.005, 0.0025, 0.0025, 0.0025, 0.0025,
+];
 
 /**
  * Distribute Catalyst Bonus up the sponsor chain.
@@ -15,16 +17,21 @@ const CATALYST_LEVEL_RATES = [0.09, 0.03, 0.01, 0.005, 0.005, 0.0025, 0.0025, 0.
  * - Credits main wallet and records a transaction for each eligible upline.
  * - Stops if sponsor chain ends, loops detected, or rates exhausted.
  */
-const distributeCatalystBonus = async ({ originUserId, amount, referenceId, trx }) => {
+const distributeCatalystBonus = async ({
+  originUserId,
+  amount,
+  referenceId,
+  trx,
+}) => {
   const query = trx || db;
   const visited = new Set();
   let currentUserId = originUserId;
   const stats = { paid: 0, skippedNoPack: 0, zeroedByCap: 0 };
 
   // Resolve staker label (name -> referral_code -> user id)
-  const stakerProfile = await query('users')
+  const stakerProfile = await query("users")
     .where({ id: originUserId })
-    .select('name', 'referral_code')
+    .select("name", "referral_code")
     .first();
   const stakerLabel =
     (stakerProfile?.name && stakerProfile.name.trim()) ||
@@ -33,9 +40,9 @@ const distributeCatalystBonus = async ({ originUserId, amount, referenceId, trx 
 
   for (let level = 0; level < CATALYST_LEVEL_RATES.length; level++) {
     // Find the sponsor/upline for the current user
-    const genealogy = await query('genealogy')
+    const genealogy = await query("genealogy")
       .where({ user_id: currentUserId })
-      .select('sponsor_id')
+      .select("sponsor_id")
       .first();
 
     const sponsorId = genealogy?.sponsor_id;
@@ -45,7 +52,7 @@ const distributeCatalystBonus = async ({ originUserId, amount, referenceId, trx 
 
     visited.add(sponsorId);
 
-      const rate = CATALYST_LEVEL_RATES[level];
+    const rate = CATALYST_LEVEL_RATES[level];
     // Eligibility: sponsor must have an active pack
     const { highestPack } = await Stake.getUserActivePackInfo(sponsorId);
     if (!highestPack) {
@@ -55,25 +62,31 @@ const distributeCatalystBonus = async ({ originUserId, amount, referenceId, trx 
     }
 
     const rawReward = parseFloat(amount) * rate;
-    const { allowed } = await RewardCap.clampIncentive(sponsorId, rawReward, query);
+    const { allowed } = await RewardCap.clampIncentive(
+      sponsorId,
+      rawReward,
+      query
+    );
 
     if (allowed > 0) {
       // Credit sponsor wallet
-        await Wallet.updateBalance(sponsorId, allowed, 'add', 'main', trx);
+      await Wallet.updateBalance(sponsorId, allowed, "add", "main", trx);
 
       // Record transaction
-      await query('transactions').insert({
+      await query("transactions").insert({
         user_id: sponsorId,
-        wallet_type: 'main',
-        transaction_type: 'catalyst_bonus',
-        reference_type: 'stake',
+        wallet_type: "main",
+        transaction_type: "catalyst_bonus",
+        reference_type: "stake",
         reference_id: referenceId?.toString?.() || String(referenceId),
-          amount: allowed,
-        currency: 'USD',
-        status: 'completed',
-          description: `Catalyst bonus (level ${level + 1}) from ${stakerLabel} stake #${referenceId}`,
+        amount: allowed,
+        currency: "USD",
+        status: "completed",
+        description: `Catalyst bonus (level ${
+          level + 1
+        }) from ${stakerLabel} stake #${referenceId}`,
         created_at: query.fn.now(),
-        updated_at: query.fn.now()
+        updated_at: query.fn.now(),
       });
     }
     if (allowed <= 0) stats.zeroedByCap += 1;
@@ -91,23 +104,26 @@ const triggerRankPromotionChain = async (userId) => {
     let current = userId;
     const maxDepth = 20; // safety cap
     for (let i = 0; i < maxDepth; i++) {
-      const node = await db('genealogy').where({ user_id: current }).select('sponsor_id').first();
+      const node = await db("genealogy")
+        .where({ user_id: current })
+        .select("sponsor_id")
+        .first();
       if (!node?.sponsor_id || uplines.includes(node.sponsor_id)) break;
       uplines.push(node.sponsor_id);
       current = node.sponsor_id;
     }
     // Promote staker + uplines
-    const { autoPromoteUser } = require('../models/Rank');
+    const { autoPromoteUser } = require("../models/Rank");
     const targets = [userId, ...uplines];
     for (const uid of targets) {
       try {
         await autoPromoteUser(uid);
       } catch (err) {
-        console.warn('Rank promotion failed for user', uid, err.message);
+        console.warn("Rank promotion failed for user", uid, err.message);
       }
     }
   } catch (err) {
-    console.warn('Rank promotion chain failed', err.message);
+    console.warn("Rank promotion chain failed", err.message);
   }
 };
 
@@ -116,14 +132,14 @@ const getAvailablePacks = async (req, res) => {
   try {
     const packs = Stake.getAvailablePacks();
     res.status(200).json({
-      status: 'SUCCESS',
-      data: { packs }
+      status: "SUCCESS",
+      data: { packs },
     });
   } catch (error) {
-    console.error('Get available packs error:', error);
+    console.error("Get available packs error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -137,7 +153,7 @@ const getUserStakes = async (req, res) => {
     const offset = (page - 1) * limit;
     const filters = {
       limit: parseInt(limit),
-      offset: parseInt(offset)
+      offset: parseInt(offset),
     };
 
     if (pack_type) filters.pack_type = pack_type;
@@ -147,22 +163,22 @@ const getUserStakes = async (req, res) => {
     const totalCount = stakes.length; // For simplicity, not implementing full pagination count
 
     res.status(200).json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         stakes,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
           total: totalCount,
-          total_pages: Math.ceil(totalCount / limit)
-        }
-      }
+          total_pages: Math.ceil(totalCount / limit),
+        },
+      },
     });
   } catch (error) {
-    console.error('Get user stakes error:', error);
+    console.error("Get user stakes error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -174,14 +190,14 @@ const getUserStakeSummary = async (req, res) => {
     const summary = await Stake.getUserStakeSummary(userId);
 
     res.status(200).json({
-      status: 'SUCCESS',
-      data: { summary }
+      status: "SUCCESS",
+      data: { summary },
     });
   } catch (error) {
-    console.error('Get user stake summary error:', error);
+    console.error("Get user stake summary error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -193,14 +209,14 @@ const getPendingRewardsSummary = async (req, res) => {
     const summary = await Stake.getPendingRewardsSummaryForUser(userId);
 
     res.status(200).json({
-      status: 'SUCCESS',
-      data: { summary }
+      status: "SUCCESS",
+      data: { summary },
     });
   } catch (error) {
-    console.error('Get pending rewards summary error:', error);
+    console.error("Get pending rewards summary error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -209,31 +225,38 @@ const getPendingRewardsSummary = async (req, res) => {
 const getStakeEligibility = async (req, res) => {
   try {
     const userId = req.user.id;
-    const [rank, synergy, stakeSummary, activeInfo, pendingRewards, incentiveCap] = await Promise.all([
+    const [
+      rank,
+      synergy,
+      stakeSummary,
+      activeInfo,
+      pendingRewards,
+      incentiveCap,
+    ] = await Promise.all([
       getRankProgress(userId),
       Synergy.getUserSummary(userId),
       Stake.getUserStakeSummary(userId),
       Stake.getUserActivePackInfo(userId),
       Stake.getPendingRewardsSummaryForUser(userId),
-      RewardCap.getCapInfo(userId)
+      RewardCap.getCapInfo(userId),
     ]);
 
     res.status(200).json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         rank,
         synergy,
         stakeSummary,
         activeInfo,
         pendingRewards,
-        incentiveCap
-      }
+        incentiveCap,
+      },
     });
   } catch (error) {
-    console.error('Get stake eligibility error:', error);
+    console.error("Get stake eligibility error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -247,16 +270,16 @@ const createStake = async (req, res) => {
     // Validate input
     if (!amount) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Amount is required'
+        status: "ERROR",
+        message: "Amount is required",
       });
     }
 
     const numAmount = parseFloat(amount);
     if (numAmount <= 0) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Invalid amount'
+        status: "ERROR",
+        message: "Invalid amount",
       });
     }
 
@@ -264,16 +287,16 @@ const createStake = async (req, res) => {
     const shares = Math.floor(numAmount / 25);
     if (shares < 1) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Minimum stake amount is $25 (1 share)'
+        status: "ERROR",
+        message: "Minimum stake amount is $25 (1 share)",
       });
     }
 
     const packType = Stake.getPackForShares(shares);
     if (!packType) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Invalid share count. Minimum 1 share required.'
+        status: "ERROR",
+        message: "Invalid share count. Minimum 1 share required.",
       });
     }
 
@@ -281,49 +304,58 @@ const createStake = async (req, res) => {
     const validation = Stake.validateStakeAmount(packType, numAmount);
     if (!validation.valid) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: validation.error
+        status: "ERROR",
+        message: validation.error,
       });
     }
 
     // Check if user has sufficient balance
-    const hasBalance = await Wallet.hasSufficientBalance(userId, numAmount, 'main');
+    const hasBalance = await Wallet.hasSufficientBalance(
+      userId,
+      numAmount,
+      "main"
+    );
     if (!hasBalance) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Insufficient wallet balance'
+        status: "ERROR",
+        message: "Insufficient wallet balance",
       });
     }
 
     // Create stake and deduct balance in transaction
     const result = await db.transaction(async (trx) => {
       // Create the stake with transaction
-      const stake = await Stake.createWithTransaction({
-        user_id: userId,
-        pack_type: packType,
-        amount: numAmount
-      }, trx);
+      const stake = await Stake.createWithTransaction(
+        {
+          user_id: userId,
+          pack_type: packType,
+          amount: numAmount,
+        },
+        trx
+      );
 
       if (!stake || !stake.id) {
-        throw new Error('Failed to create stake - no ID returned');
+        throw new Error("Failed to create stake - no ID returned");
       }
 
       // Deduct from wallet
-      await Wallet.updateBalance(userId, numAmount, 'subtract', 'main', trx);
+      await Wallet.updateBalance(userId, numAmount, "subtract", "main", trx);
 
       // Create transaction record
-      await trx('transactions').insert({
+      await trx("transactions").insert({
         user_id: userId,
-        wallet_type: 'main',
-        transaction_type: 'stake',
-        reference_type: 'stake',
+        wallet_type: "main",
+        transaction_type: "stake",
+        reference_type: "stake",
         reference_id: stake.id.toString(),
         amount: -numAmount, // negative for debit
-        currency: 'USD',
-        status: 'completed',
-        description: `Staked ${shares} share${shares > 1 ? 's' : ''} ($${numAmount.toFixed(2)}) to ${packType} pack`,
+        currency: "USD",
+        status: "completed",
+        description: `Staked ${shares} share${
+          shares > 1 ? "s" : ""
+        } ($${numAmount.toFixed(2)}) to ${packType} pack`,
         created_at: trx.fn.now(),
-        updated_at: trx.fn.now()
+        updated_at: trx.fn.now(),
       });
 
       // Distribute Catalyst Bonus up the referral chain
@@ -331,11 +363,11 @@ const createStake = async (req, res) => {
         originUserId: userId,
         amount: numAmount,
         referenceId: stake.id,
-        trx
+        trx,
       });
 
       // Add volume to Synergy Flow (binary) uplines
-      await Synergy.addVolumeToUplines(userId, numAmount, trx);
+      await Synergy.addVolumeToUplines(userId, numAmount, trx, false);
 
       return { stake, catalystStats };
     });
@@ -344,25 +376,26 @@ const createStake = async (req, res) => {
     triggerRankPromotionChain(userId);
 
     res.status(200).json({
-      status: 'SUCCESS',
-      message: `Successfully staked ${shares} share${shares > 1 ? 's' : ''} to ${packType} pack`,
+      status: "SUCCESS",
+      message: `Successfully staked ${shares} share${
+        shares > 1 ? "s" : ""
+      } to ${packType} pack`,
       data: {
         stake: result.stake,
-        catalyst: result.catalystStats
-      }
+        catalyst: result.catalystStats,
+      },
     });
-
   } catch (error) {
-    console.error('Create stake error:', error);
+    console.error("Create stake error:", error);
 
-    let errorMessage = 'Failed to create stake';
+    let errorMessage = "Failed to create stake";
     if (error.message) {
       errorMessage += `: ${error.message}`;
     }
 
     res.status(500).json({
-      status: 'ERROR',
-      message: errorMessage
+      status: "ERROR",
+      message: errorMessage,
     });
   }
 };
@@ -378,14 +411,14 @@ const getStakeRewards = async (req, res) => {
     const stake = await Stake.findById(stake_id);
     if (!stake || stake.user_id !== userId) {
       return res.status(404).json({
-        status: 'ERROR',
-        message: 'Stake not found'
+        status: "ERROR",
+        message: "Stake not found",
       });
     }
 
     const filters = {
       limit: parseInt(limit),
-      offset: (page - 1) * limit
+      offset: (page - 1) * limit,
     };
 
     if (status) filters.status = status;
@@ -406,7 +439,7 @@ const getStakeRewards = async (req, res) => {
     );
 
     res.status(200).json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         stake_id,
         rewards,
@@ -415,16 +448,15 @@ const getStakeRewards = async (req, res) => {
           page: parseInt(page),
           limit: parseInt(limit),
           total: rewards.length,
-          total_pages: Math.ceil(rewards.length / limit)
-        }
-      }
+          total_pages: Math.ceil(rewards.length / limit),
+        },
+      },
     });
-
   } catch (error) {
-    console.error('Get stake rewards error:', error);
+    console.error("Get stake rewards error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -440,24 +472,25 @@ const creditStakeRewards = async (req, res) => {
     const stake = await Stake.findById(stake_id);
     if (!stake || stake.user_id !== userId) {
       return res.status(404).json({
-        status: 'ERROR',
-        message: 'Stake not found'
+        status: "ERROR",
+        message: "Stake not found",
       });
     }
 
     const result = await Stake.creditPendingRewards(stake_id, reward_ids);
 
     res.status(200).json({
-      status: 'SUCCESS',
-      message: `Credited ${result.credited} rewards totaling $${result.totalAmount.toFixed(2)}`,
-      data: result
+      status: "SUCCESS",
+      message: `Credited ${
+        result.credited
+      } rewards totaling $${result.totalAmount.toFixed(2)}`,
+      data: result,
     });
-
   } catch (error) {
-    console.error('Credit stake rewards error:', error);
+    console.error("Credit stake rewards error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -471,18 +504,17 @@ const calculateDailyRewards = async (req, res) => {
     const result = await Stake.runDailyCoreHarvest();
 
     res.status(200).json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       message: result.skipped
-        ? 'Daily core/harvest already ran today'
+        ? "Daily core/harvest already ran today"
         : `Processed ${result.stakes_processed} stakes, created ${result.rewards_created} rewards`,
-      data: result
+      data: result,
     });
-
   } catch (error) {
-    console.error('Calculate daily rewards error:', error);
+    console.error("Calculate daily rewards error:", error);
     res.status(500).json({
-      status: 'ERROR',
-      message: 'Internal server error'
+      status: "ERROR",
+      message: "Internal server error",
     });
   }
 };
@@ -496,5 +528,5 @@ module.exports = {
   createStake,
   getStakeRewards,
   creditStakeRewards,
-  calculateDailyRewards
+  calculateDailyRewards,
 };

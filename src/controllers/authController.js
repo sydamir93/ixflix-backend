@@ -1187,6 +1187,7 @@ async function getCurrentUser(req, res) {
         referralCode: user.referral_code,
         has2FA: !!twoFactor,
         isVerified: user.is_verified,
+        withdrawal_disabled: user.withdrawal_disabled,
       },
     });
   } catch (err) {
@@ -1346,7 +1347,10 @@ async function buildGenealogyTree(
 
   // Preserve previous behavior: newest join first
   for (const [, arr] of childrenBySponsorId.entries()) {
-    arr.sort((a, b) => new Date(b.joined_at).getTime() - new Date(a.joined_at).getTime());
+    arr.sort(
+      (a, b) =>
+        new Date(b.joined_at).getTime() - new Date(a.joined_at).getTime()
+    );
   }
 
   const build = (parentSponsorId, path = new Set()) => {
@@ -1359,7 +1363,10 @@ async function buildGenealogyTree(
       const nextPath = new Set(path);
       nextPath.add(id);
 
-      const stakeInfo = stakeInfoByUserId.get(id) || { highestPack: null, totalAmount: 0 };
+      const stakeInfo = stakeInfoByUserId.get(id) || {
+        highestPack: null,
+        totalAmount: 0,
+      };
 
       out.push({
         id,
@@ -1447,7 +1454,7 @@ async function buildPlacementTree(
   }
 
   // Preserve previous behavior: left before right, then older joins first
-  const posOrder = (p) => (p === 'left' ? 0 : p === 'right' ? 1 : 2);
+  const posOrder = (p) => (p === "left" ? 0 : p === "right" ? 1 : 2);
   for (const [, arr] of childrenByParentId.entries()) {
     arr.sort((a, b) => {
       const pa = posOrder(a.position);
@@ -1467,7 +1474,10 @@ async function buildPlacementTree(
       const nextPath = new Set(path);
       nextPath.add(id);
 
-      const stakeInfo = stakeInfoByUserId.get(id) || { highestPack: null, totalAmount: 0 };
+      const stakeInfo = stakeInfoByUserId.get(id) || {
+        highestPack: null,
+        totalAmount: 0,
+      };
 
       out.push({
         id,

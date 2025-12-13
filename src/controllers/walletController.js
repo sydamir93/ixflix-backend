@@ -19,6 +19,20 @@ const initiateWithdraw = async (req, res) => {
     }
 
     const userId = req.user.id;
+
+    // Check if user has withdrawals disabled
+    const user = await db("users")
+      .where({ id: userId })
+      .select("withdrawal_disabled")
+      .first();
+    if (user?.withdrawal_disabled) {
+      return res.status(403).json({
+        status: "ERROR",
+        message:
+          "Your account has withdrawals disabled. Please contact support.",
+      });
+    }
+
     const { amount, address, payoutCurrency = "usdtbsc" } = req.body;
 
     if (!amount || parseFloat(amount) <= 0) {

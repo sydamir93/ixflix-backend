@@ -15,6 +15,7 @@ router.post('/users/:userId/manual-deposit', adminController.manualDepositToUser
 
 // Stakes
 router.get('/stakes', adminController.listStakes);
+router.post('/stakes/free', adminController.createFreeStake);
 
 // Deposits
 router.get('/deposits', adminController.listDeposits);

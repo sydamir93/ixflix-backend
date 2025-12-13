@@ -1,15 +1,15 @@
-const db = require('../config/database');
-const Stake = require('./Stake');
-const Genealogy = require('./Genealogy');
-const JobRun = require('./JobRun');
-const RewardCap = require('./RewardCap');
+const db = require("../config/database");
+const Stake = require("./Stake");
+const Genealogy = require("./Genealogy");
+const JobRun = require("./JobRun");
+const RewardCap = require("./RewardCap");
 
 // Synergy Flow rates by pack
 const SYNERGY_RATES = {
   spark: 0.05,
   pulse: 0.06,
   charge: 0.08,
-  quantum: 0.10
+  quantum: 0.1,
 };
 
 const CYCLE_SIZE = 100; // USD100 left + USD100 right = 1 cycle
@@ -17,42 +17,53 @@ const CYCLE_SIZE = 100; // USD100 left + USD100 right = 1 cycle
 class Synergy {
   static async ensureVolumeRow(userId, trx = null) {
     const query = trx || db;
-    const existing = await query('team_volumes').where({ user_id: userId }).first();
+    const existing = await query("team_volumes")
+      .where({ user_id: userId })
+      .first();
     if (existing) return existing;
-    await query('team_volumes').insert({ user_id: userId, created_at: query.fn.now(), updated_at: query.fn.now() });
-    return await query('team_volumes').where({ user_id: userId }).first();
+    await query("team_volumes").insert({
+      user_id: userId,
+      created_at: query.fn.now(),
+      updated_at: query.fn.now(),
+    });
+    return await query("team_volumes").where({ user_id: userId }).first();
   }
 
   // Eligibility: at least 1 active direct on left AND 1 active direct on right with an active stake
   static async hasActiveDirectOnSide(userId, side) {
     // Single query instead of "find direct" then "find stake" (N+1 in loops).
-    const row = await db('genealogy as g')
-      .join('users as u', 'g.user_id', 'u.id')
-      .join('stakes as s', 's.user_id', 'u.id')
-      .where({ 'g.parent_id': userId, 'g.position': side })
-      .andWhere('u.is_verified', true)
-      .andWhere('s.status', 'active')
-      .select('u.id')
+    const row = await db("genealogy as g")
+      .join("users as u", "g.user_id", "u.id")
+      .join("stakes as s", "s.user_id", "u.id")
+      .where({ "g.parent_id": userId, "g.position": side })
+      .andWhere("u.is_verified", true)
+      .andWhere("s.status", "active")
+      .select("u.id")
       .first();
 
     return !!row;
   }
 
   static async getEligibility(userId) {
-    const leftActive = await this.hasActiveDirectOnSide(userId, 'left');
-    const rightActive = await this.hasActiveDirectOnSide(userId, 'right');
+    const leftActive = await this.hasActiveDirectOnSide(userId, "left");
+    const rightActive = await this.hasActiveDirectOnSide(userId, "right");
     const eligible = leftActive && rightActive;
     return {
       eligible,
-      reasons: eligible ? [] : ['Need 1 active direct on each side'],
+      reasons: eligible ? [] : ["Need 1 active direct on each side"],
       leftActive,
-      rightActive
+      rightActive,
     };
   }
 
   // Add volume to uplines along binary parent chain, using child's position (left/right)
-  static async addVolumeToUplines(userId, amount, trx = null) {
+  static async addVolumeToUplines(userId, amount, trx = null, isFree = false) {
     const query = trx || db;
+
+    // Don't add volume for free stakes - they don't count as sales
+    if (isFree) {
+      return;
+    }
 
     // Recursive CTE: fetch the full parent chain (child->parent) in one DB round trip.
     const raw = await query.raw(
@@ -85,7 +96,7 @@ class Synergy {
       [userId]
     );
 
-    const rows = Array.isArray(raw) ? (raw[0] || []) : (raw?.rows || []);
+    const rows = Array.isArray(raw) ? raw[0] || [] : raw?.rows || [];
     if (!rows.length) return;
 
     // Ensure all parent volume rows exist (batch).
@@ -93,17 +104,21 @@ class Synergy {
       new Set(rows.map((r) => Number(r.parent_id)).filter(Boolean))
     );
 
-    const existing = await query('team_volumes')
-      .whereIn('user_id', parentIds)
-      .select('user_id');
+    const existing = await query("team_volumes")
+      .whereIn("user_id", parentIds)
+      .select("user_id");
     const existingSet = new Set(existing.map((r) => Number(r.user_id)));
 
     const toInsert = parentIds
       .filter((id) => !existingSet.has(id))
-      .map((id) => ({ user_id: id, created_at: query.fn.now(), updated_at: query.fn.now() }));
+      .map((id) => ({
+        user_id: id,
+        created_at: query.fn.now(),
+        updated_at: query.fn.now(),
+      }));
 
     if (toInsert.length) {
-      await query('team_volumes').insert(toInsert);
+      await query("team_volumes").insert(toInsert);
     }
 
     // Apply increments (one update per ancestor; no extra reads).
@@ -112,15 +127,15 @@ class Synergy {
       const position = r.position;
       if (!parentId) continue;
 
-      if (position === 'left') {
-        await query('team_volumes')
+      if (position === "left") {
+        await query("team_volumes")
           .where({ user_id: parentId })
-          .increment('left_volume', amount)
+          .increment("left_volume", amount)
           .update({ updated_at: query.fn.now() });
-      } else if (position === 'right') {
-        await query('team_volumes')
+      } else if (position === "right") {
+        await query("team_volumes")
           .where({ user_id: parentId })
-          .increment('right_volume', amount)
+          .increment("right_volume", amount)
           .update({ updated_at: query.fn.now() });
       }
     }
@@ -130,21 +145,25 @@ class Synergy {
     const query = trx || db;
     if (volumeRow.last_reset_date === todayStr) return volumeRow;
 
-    return query('team_volumes')
+    return query("team_volumes")
       .where({ user_id: volumeRow.user_id })
       .update({
         daily_paid: 0,
         last_reset_date: todayStr,
-        updated_at: query.fn.now()
+        updated_at: query.fn.now(),
       })
       .then(async () => {
-        const refreshed = await query('team_volumes').where({ user_id: volumeRow.user_id }).first();
+        const refreshed = await query("team_volumes")
+          .where({ user_id: volumeRow.user_id })
+          .first();
         return refreshed || volumeRow;
       });
   }
 
   static async getUserRateAndCap(userId) {
-    const { highestPack, totalAmount } = await Stake.getUserActivePackInfo(userId);
+    const { highestPack, totalAmount } = await Stake.getUserActivePackInfo(
+      userId
+    );
     const rate = highestPack ? SYNERGY_RATES[highestPack] || 0 : 0;
     return { rate, packType: highestPack, cap: totalAmount };
   }
@@ -152,11 +171,13 @@ class Synergy {
   static async processUserCycles(userId, trx = null) {
     const query = trx || db;
     const volumeRow = await this.ensureVolumeRow(userId, query);
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = new Date().toISOString().split("T")[0];
     const freshRow = await this.resetDailyIfNeeded(volumeRow, todayStr, query);
 
-    const leftTotal = Number(freshRow.left_volume || 0) + Number(freshRow.left_carry || 0);
-    const rightTotal = Number(freshRow.right_volume || 0) + Number(freshRow.right_carry || 0);
+    const leftTotal =
+      Number(freshRow.left_volume || 0) + Number(freshRow.left_carry || 0);
+    const rightTotal =
+      Number(freshRow.right_volume || 0) + Number(freshRow.right_carry || 0);
 
     if (leftTotal < CYCLE_SIZE || rightTotal < CYCLE_SIZE) {
       return { cycles: 0, reward: 0 };
@@ -172,11 +193,16 @@ class Synergy {
       return { cycles: 0, reward: 0 };
     }
 
-    const cyclesAvailable = Math.floor(Math.min(leftTotal, rightTotal) / CYCLE_SIZE);
+    const cyclesAvailable = Math.floor(
+      Math.min(leftTotal, rightTotal) / CYCLE_SIZE
+    );
     if (cyclesAvailable <= 0) return { cycles: 0, reward: 0, eligible: true };
 
     const perCycleReward = CYCLE_SIZE * rate;
-    const remainingCap = Math.max(0, Number(cap) - Number(freshRow.daily_paid || 0));
+    const remainingCap = Math.max(
+      0,
+      Number(cap) - Number(freshRow.daily_paid || 0)
+    );
     const maxCyclesByCap = Math.floor(remainingCap / perCycleReward);
     const cyclesToPay = Math.min(cyclesAvailable, maxCyclesByCap);
     if (cyclesToPay <= 0) {
@@ -186,21 +212,23 @@ class Synergy {
       const isLeftWeaker = leftTotal <= rightTotal;
       const newLeftCarry = isLeftWeaker ? 0 : stronger - weaker;
       const newRightCarry = isLeftWeaker ? stronger - weaker : 0;
-      await query('team_volumes')
-        .where({ user_id: userId })
-        .update({
-          left_volume: 0,
-          right_volume: 0,
-          left_carry: newLeftCarry,
-          right_carry: newRightCarry,
-          updated_at: query.fn.now()
-        });
+      await query("team_volumes").where({ user_id: userId }).update({
+        left_volume: 0,
+        right_volume: 0,
+        left_carry: newLeftCarry,
+        right_carry: newRightCarry,
+        updated_at: query.fn.now(),
+      });
       return { cycles: 0, reward: 0, eligible: true, capReached: true };
     }
 
     let rewardAmount = cyclesToPay * perCycleReward;
     // Apply combined cap for incentive rewards
-    const { allowed } = await RewardCap.clampIncentive(userId, rewardAmount, query);
+    const { allowed } = await RewardCap.clampIncentive(
+      userId,
+      rewardAmount,
+      query
+    );
     const capApplied = allowed < rewardAmount;
     rewardAmount = allowed;
     if (rewardAmount <= 0) {
@@ -212,7 +240,7 @@ class Synergy {
     const newRight = rightTotal - usedVolume;
 
     // Update carries and zero out temp volumes
-    await query('team_volumes')
+    await query("team_volumes")
       .where({ user_id: userId })
       .update({
         left_volume: 0,
@@ -221,11 +249,11 @@ class Synergy {
         right_carry: newRight,
         daily_paid: Number(freshRow.daily_paid || 0) + rewardAmount,
         last_reset_date: todayStr,
-        updated_at: query.fn.now()
+        updated_at: query.fn.now(),
       });
 
     // Record cycle history
-    await query('team_cycles').insert({
+    await query("team_cycles").insert({
       user_id: userId,
       cycle_date: todayStr,
       cycles: cyclesToPay,
@@ -235,45 +263,58 @@ class Synergy {
       reward_amount: rewardAmount,
       rate_used: rate,
       pack_type: packType,
-      status: 'completed',
+      status: "completed",
       created_at: query.fn.now(),
-      updated_at: query.fn.now()
+      updated_at: query.fn.now(),
     });
 
     // Credit wallet and transaction
     await query.transaction(async (innerTrx) => {
-      await innerTrx('wallets')
-        .where({ user_id: userId, wallet_type: 'main' })
-        .increment('balance', rewardAmount);
+      await innerTrx("wallets")
+        .where({ user_id: userId, wallet_type: "main" })
+        .increment("balance", rewardAmount);
 
-      await innerTrx('transactions').insert({
+      await innerTrx("transactions").insert({
         user_id: userId,
-        wallet_type: 'main',
-        transaction_type: 'synergy_flow',
-        reference_type: 'team_cycle',
+        wallet_type: "main",
+        transaction_type: "synergy_flow",
+        reference_type: "team_cycle",
         reference_id: `${userId}-${todayStr}`,
         amount: rewardAmount,
-        currency: 'USD',
-        status: 'completed',
-        description: `Synergy Flow payout (${cyclesToPay} cycles @ ${rate * 100}%)`,
+        currency: "USD",
+        status: "completed",
+        description: `Synergy Flow payout (${cyclesToPay} cycles @ ${
+          rate * 100
+        }%)`,
         created_at: innerTrx.fn.now(),
-        updated_at: innerTrx.fn.now()
+        updated_at: innerTrx.fn.now(),
       });
     });
 
-    return { cycles: cyclesToPay, reward: rewardAmount, packType, eligible: true };
+    return {
+      cycles: cyclesToPay,
+      reward: rewardAmount,
+      packType,
+      eligible: true,
+    };
   }
 
   static async processAllUsers() {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const existing = await JobRun.getStatus('synergy_flow');
-    if (existing && existing.run_date === todayStr && existing.status === 'success') {
-      return { skipped: true, message: 'already ran today' };
+    const todayStr = new Date().toISOString().split("T")[0];
+    const existing = await JobRun.getStatus("synergy_flow");
+    if (
+      existing &&
+      existing.run_date === todayStr &&
+      existing.status === "success"
+    ) {
+      return { skipped: true, message: "already ran today" };
     }
 
-    await JobRun.start('synergy_flow', todayStr, { note: 'Synergy daily payout' });
+    await JobRun.start("synergy_flow", todayStr, {
+      note: "Synergy daily payout",
+    });
 
-    const users = await db('team_volumes').select('user_id');
+    const users = await db("team_volumes").select("user_id");
     let processed = 0;
     let cycles = 0;
     let rewards = 0;
@@ -289,12 +330,12 @@ class Synergy {
       if (result.ineligible) ineligible += 1;
     }
 
-    await JobRun.finish('synergy_flow', todayStr, 'success', {
+    await JobRun.finish("synergy_flow", todayStr, "success", {
       processed,
       cycles,
       rewards,
       capHits,
-      ineligible
+      ineligible,
     });
 
     return { users: processed, cycles, rewards, capHits, ineligible };
@@ -302,12 +343,16 @@ class Synergy {
 
   static async getUserSummary(userId) {
     const volumeRow = await this.ensureVolumeRow(userId);
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = new Date().toISOString().split("T")[0];
     const { rate, packType, cap } = await this.getUserRateAndCap(userId);
     const eligibility = await this.getEligibility(userId);
-    const leftTotal = Number(volumeRow.left_volume || 0) + Number(volumeRow.left_carry || 0);
-    const rightTotal = Number(volumeRow.right_volume || 0) + Number(volumeRow.right_carry || 0);
-    const cyclesAvailable = Math.floor(Math.min(leftTotal, rightTotal) / CYCLE_SIZE);
+    const leftTotal =
+      Number(volumeRow.left_volume || 0) + Number(volumeRow.left_carry || 0);
+    const rightTotal =
+      Number(volumeRow.right_volume || 0) + Number(volumeRow.right_carry || 0);
+    const cyclesAvailable = Math.floor(
+      Math.min(leftTotal, rightTotal) / CYCLE_SIZE
+    );
     const perCycleReward = rate ? CYCLE_SIZE * rate : 0;
     const remainingCap = Math.max(0, cap - Number(volumeRow.daily_paid || 0));
 
@@ -329,27 +374,26 @@ class Synergy {
       eligible: eligibility.eligible,
       eligibility_reasons: eligibility.reasons || [],
       left_active_direct: eligibility.leftActive,
-      right_active_direct: eligibility.rightActive
+      right_active_direct: eligibility.rightActive,
     };
   }
 
   static async getUserHistory(userId, { limit = 20, offset = 0 } = {}) {
-    return db('team_cycles')
+    return db("team_cycles")
       .where({ user_id: userId })
-      .orderBy('cycle_date', 'desc')
+      .orderBy("cycle_date", "desc")
       .limit(limit)
       .offset(offset);
   }
 
   static async getAllHistory({ limit = 50, offset = 0 } = {}) {
-    return db('team_cycles')
-      .select('team_cycles.*', 'users.name')
-      .leftJoin('users', 'users.id', 'team_cycles.user_id')
-      .orderBy('cycle_date', 'desc')
+    return db("team_cycles")
+      .select("team_cycles.*", "users.name")
+      .leftJoin("users", "users.id", "team_cycles.user_id")
+      .orderBy("cycle_date", "desc")
       .limit(limit)
       .offset(offset);
   }
 }
 
 module.exports = Synergy;
-

@@ -1,15 +1,139 @@
-const db = require('../config/database');
-const Wallet = require('../models/Wallet');
-const Transaction = require('../models/Transaction');
-const NowPaymentService = require('../services/NowPaymentService');
-const { logger } = require('../utils/logger');
-const bcrypt = require('bcryptjs');
+const db = require("../config/database");
+const Wallet = require("../models/Wallet");
+const Transaction = require("../models/Transaction");
+const Stake = require("../models/Stake");
+const Synergy = require("../models/Synergy");
+const RewardCap = require("../models/RewardCap");
+const NowPaymentService = require("../services/NowPaymentService");
+const { logger } = require("../utils/logger");
+const bcrypt = require("bcryptjs");
 
 const DEFAULT_PAGE_SIZE = 25;
 
+// Catalyst Bonus percentages per level (up to 9 levels) from the reward plan
+const CATALYST_LEVEL_RATES = [
+  0.09, 0.03, 0.01, 0.005, 0.005, 0.0025, 0.0025, 0.0025, 0.0025,
+];
+
+/**
+ * Distribute Catalyst Bonus up the sponsor chain.
+ * - Traverses genealogy via sponsor_id (not binary parent).
+ * - Credits main wallet and records a transaction for each eligible upline.
+ * - Stops if sponsor chain ends, loops detected, or rates exhausted.
+ */
+const distributeCatalystBonus = async ({
+  originUserId,
+  amount,
+  referenceId,
+  trx,
+}) => {
+  const query = trx || db;
+  const visited = new Set();
+  let currentUserId = originUserId;
+  const stats = { paid: 0, skippedNoPack: 0, zeroedByCap: 0 };
+
+  // Resolve staker label (name -> referral_code -> user id)
+  const stakerProfile = await query("users")
+    .where({ id: originUserId })
+    .select("name", "referral_code")
+    .first();
+  const stakerLabel =
+    (stakerProfile?.name && stakerProfile.name.trim()) ||
+    stakerProfile?.referral_code ||
+    `user #${originUserId}`;
+
+  for (let level = 0; level < CATALYST_LEVEL_RATES.length; level++) {
+    // Find the sponsor/upline for the current user
+    const genealogy = await query("genealogy")
+      .where({ user_id: currentUserId })
+      .select("sponsor_id")
+      .first();
+
+    const sponsorId = genealogy?.sponsor_id;
+    if (!sponsorId || visited.has(sponsorId) || sponsorId === currentUserId) {
+      break; // No further upline or loop detected
+    }
+
+    visited.add(sponsorId);
+
+    const rate = CATALYST_LEVEL_RATES[level];
+    // Eligibility: sponsor must have an active pack
+    const { highestPack } = await Stake.getUserActivePackInfo(sponsorId);
+    if (!highestPack) {
+      stats.skippedNoPack += 1;
+      currentUserId = sponsorId;
+      continue;
+    }
+
+    const rawReward = parseFloat(amount) * rate;
+    const { allowed } = await RewardCap.clampIncentive(
+      sponsorId,
+      rawReward,
+      query
+    );
+
+    if (allowed > 0) {
+      // Credit sponsor wallet
+      await Wallet.updateBalance(sponsorId, allowed, "add", "main", trx);
+
+      // Record transaction
+      await query("transactions").insert({
+        user_id: sponsorId,
+        wallet_type: "main",
+        transaction_type: "catalyst_bonus",
+        reference_type: "stake",
+        reference_id: referenceId?.toString?.() || String(referenceId),
+        amount: allowed,
+        currency: "USD",
+        status: "completed",
+        description: `Catalyst bonus (level ${
+          level + 1
+        }) from ${stakerLabel} stake #${referenceId}`,
+        created_at: query.fn.now(),
+        updated_at: query.fn.now(),
+      });
+    }
+    if (allowed <= 0) stats.zeroedByCap += 1;
+
+    // Move up the chain
+    currentUserId = sponsorId;
+  }
+  return stats;
+};
+
+// Promote ranks for staker and sponsor chain (non-blocking best-effort)
+const triggerRankPromotionChain = async (userId) => {
+  try {
+    const uplines = [];
+    let current = userId;
+    const maxDepth = 20; // safety cap
+    for (let i = 0; i < maxDepth; i++) {
+      const node = await db("genealogy")
+        .where({ user_id: current })
+        .select("sponsor_id")
+        .first();
+      if (!node?.sponsor_id || uplines.includes(node.sponsor_id)) break;
+      uplines.push(node.sponsor_id);
+      current = node.sponsor_id;
+    }
+    // Promote staker + uplines
+    const { autoPromoteUser } = require("../models/Rank");
+    const targets = [userId, ...uplines];
+    for (const uid of targets) {
+      try {
+        await autoPromoteUser(uid);
+      } catch (err) {
+        console.warn("Rank promotion failed for user", uid, err.message);
+      }
+    }
+  } catch (err) {
+    console.warn("Rank promotion chain failed", err.message);
+  }
+};
+
 const parseMetadata = (metadata) => {
   if (!metadata) return {};
-  if (typeof metadata === 'object') return { ...metadata };
+  if (typeof metadata === "object") return { ...metadata };
   try {
     return JSON.parse(metadata);
   } catch {
@@ -19,30 +143,30 @@ const parseMetadata = (metadata) => {
 
 const mapDepositStatus = (paymentStatus) => {
   switch (paymentStatus) {
-    case 'finished':
-    case 'confirmed':
-      return 'completed';
-    case 'failed':
-    case 'expired':
-      return 'failed';
-    case 'partially_paid':
-      return 'partially_paid';
+    case "finished":
+    case "confirmed":
+      return "completed";
+    case "failed":
+    case "expired":
+      return "failed";
+    case "partially_paid":
+      return "partially_paid";
     default:
-      return 'pending';
+      return "pending";
   }
 };
 
 const mapPayoutStatus = (payoutStatus) => {
   switch (payoutStatus) {
-    case 'finished':
-    case 'confirmed':
-      return 'completed';
-    case 'failed':
-    case 'expired':
-    case 'rejected':
-      return 'failed';
+    case "finished":
+    case "confirmed":
+      return "completed";
+    case "failed":
+    case "expired":
+    case "rejected":
+      return "failed";
     default:
-      return 'pending';
+      return "pending";
   }
 };
 
@@ -54,23 +178,23 @@ const listDeposits = async (req, res) => {
     const offset = (page - 1) * limit;
     const { status, user_id: userId, search } = req.query;
 
-    const baseQuery = db('transactions as t')
-      .join('users as u', 't.user_id', 'u.id')
-      .where('t.transaction_type', 'deposit');
+    const baseQuery = db("transactions as t")
+      .join("users as u", "t.user_id", "u.id")
+      .where("t.transaction_type", "deposit");
 
     if (status) {
-      baseQuery.andWhere('t.status', status);
+      baseQuery.andWhere("t.status", status);
     }
 
     if (userId) {
-      baseQuery.andWhere('t.user_id', userId);
+      baseQuery.andWhere("t.user_id", userId);
     }
 
     if (search) {
       baseQuery.andWhere((qb) => {
-        qb.where('u.phone_number', 'like', `%${search}%`)
-          .orWhere('u.email', 'like', `%${search}%`)
-          .orWhere('u.name', 'like', `%${search}%`);
+        qb.where("u.phone_number", "like", `%${search}%`)
+          .orWhere("u.email", "like", `%${search}%`)
+          .orWhere("u.name", "like", `%${search}%`);
       });
     }
 
@@ -78,37 +202,42 @@ const listDeposits = async (req, res) => {
       baseQuery
         .clone()
         .select(
-          't.*',
-          'u.name as user_name',
-          'u.email as user_email',
-          'u.phone_number as user_phone'
+          "t.*",
+          "u.name as user_name",
+          "u.email as user_email",
+          "u.phone_number as user_phone"
         )
-        .orderBy('t.created_at', 'desc')
+        .orderBy("t.created_at", "desc")
         .limit(limit)
         .offset(offset),
-      baseQuery.clone().count('* as count')
+      baseQuery.clone().count("* as count"),
     ]);
 
     const transactions = rows.map((row) => ({
       ...row,
-      metadata: parseMetadata(row.metadata)
+      metadata: parseMetadata(row.metadata),
     }));
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         transactions,
         pagination: {
           page,
           limit,
           total: parseInt(count, 10) || 0,
-          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
-        }
-      }
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit),
+        },
+      },
     });
   } catch (error) {
-    logger.error('List deposits (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch deposits' });
+    logger.error("List deposits (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch deposits" });
   }
 };
 
@@ -120,23 +249,23 @@ const listWithdrawals = async (req, res) => {
     const offset = (page - 1) * limit;
     const { status, user_id: userId, search } = req.query;
 
-    const baseQuery = db('transactions as t')
-      .join('users as u', 't.user_id', 'u.id')
-      .where('t.transaction_type', 'withdraw');
+    const baseQuery = db("transactions as t")
+      .join("users as u", "t.user_id", "u.id")
+      .where("t.transaction_type", "withdraw");
 
     if (status) {
-      baseQuery.andWhere('t.status', status);
+      baseQuery.andWhere("t.status", status);
     }
 
     if (userId) {
-      baseQuery.andWhere('t.user_id', userId);
+      baseQuery.andWhere("t.user_id", userId);
     }
 
     if (search) {
       baseQuery.andWhere((qb) => {
-        qb.where('u.phone_number', 'like', `%${search}%`)
-          .orWhere('u.email', 'like', `%${search}%`)
-          .orWhere('u.name', 'like', `%${search}%`);
+        qb.where("u.phone_number", "like", `%${search}%`)
+          .orWhere("u.email", "like", `%${search}%`)
+          .orWhere("u.name", "like", `%${search}%`);
       });
     }
 
@@ -144,37 +273,42 @@ const listWithdrawals = async (req, res) => {
       baseQuery
         .clone()
         .select(
-          't.*',
-          'u.name as user_name',
-          'u.email as user_email',
-          'u.phone_number as user_phone'
+          "t.*",
+          "u.name as user_name",
+          "u.email as user_email",
+          "u.phone_number as user_phone"
         )
-        .orderBy('t.created_at', 'desc')
+        .orderBy("t.created_at", "desc")
         .limit(limit)
         .offset(offset),
-      baseQuery.clone().count('* as count')
+      baseQuery.clone().count("* as count"),
     ]);
 
     const transactions = rows.map((row) => ({
       ...row,
-      metadata: parseMetadata(row.metadata)
+      metadata: parseMetadata(row.metadata),
     }));
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         transactions,
         pagination: {
           page,
           limit,
           total: parseInt(count, 10) || 0,
-          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
-        }
-      }
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit),
+        },
+      },
     });
   } catch (error) {
-    logger.error('List withdrawals (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch withdrawals' });
+    logger.error("List withdrawals (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch withdrawals" });
   }
 };
 
@@ -186,18 +320,21 @@ const listUsers = async (req, res) => {
     const offset = (page - 1) * limit;
     const { role, search } = req.query;
 
-    const baseQuery = db('users')
-      .leftJoin('two_factor_auth as tfa', 'users.id', 'tfa.user_id');
+    const baseQuery = db("users").leftJoin(
+      "two_factor_auth as tfa",
+      "users.id",
+      "tfa.user_id"
+    );
 
     if (role) {
-      baseQuery.andWhere('role', role);
+      baseQuery.andWhere("role", role);
     }
 
     if (search) {
       baseQuery.andWhere((qb) => {
-        qb.where('phone_number', 'like', `%${search}%`)
-          .orWhere('email', 'like', `%${search}%`)
-          .orWhere('name', 'like', `%${search}%`);
+        qb.where("phone_number", "like", `%${search}%`)
+          .orWhere("email", "like", `%${search}%`)
+          .orWhere("name", "like", `%${search}%`);
       });
     }
 
@@ -205,39 +342,45 @@ const listUsers = async (req, res) => {
       baseQuery
         .clone()
         .select(
-          'users.id',
-          'users.name',
-          'users.email',
-          'users.phone_number',
-          'users.role',
-          'users.is_active',
-          'users.is_verified',
-          'users.created_at',
-          'users.updated_at',
-          'users.referral_code',
-          db.raw('COALESCE(tfa.is_enabled, false) as has_2fa')
+          "users.id",
+          "users.name",
+          "users.email",
+          "users.phone_number",
+          "users.role",
+          "users.is_active",
+          "users.withdrawal_disabled",
+          "users.is_verified",
+          "users.created_at",
+          "users.updated_at",
+          "users.referral_code",
+          db.raw("COALESCE(tfa.is_enabled, false) as has_2fa")
         )
-        .orderBy('created_at', 'desc')
+        .orderBy("created_at", "desc")
         .limit(limit)
         .offset(offset),
-      baseQuery.clone().count('* as count')
+      baseQuery.clone().count("* as count"),
     ]);
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         users: rows,
         pagination: {
           page,
           limit,
           total: parseInt(count, 10) || 0,
-          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
-        }
-      }
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit),
+        },
+      },
     });
   } catch (error) {
-    logger.error('List users (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch users' });
+    logger.error("List users (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch users" });
   }
 };
 
@@ -245,63 +388,105 @@ const listUsers = async (req, res) => {
 const updateUser = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { name, email, phoneNumber, role, is_active: isActive, password } = req.body;
+    const {
+      name,
+      email,
+      phoneNumber,
+      role,
+      is_active: isActive,
+      withdrawal_disabled: withdrawalDisabled,
+      password,
+    } = req.body;
     const updates = {};
 
-    const user = await db('users').where({ id: userId }).first();
+    const user = await db("users").where({ id: userId }).first();
     if (!user) {
-      return res.status(404).json({ status: 'ERROR', message: 'User not found' });
+      return res
+        .status(404)
+        .json({ status: "ERROR", message: "User not found" });
     }
 
     if (name) updates.name = name.trim();
 
     if (email) {
-      const existing = await db('users').where({ email }).andWhereNot({ id: userId }).first();
+      const existing = await db("users")
+        .where({ email })
+        .andWhereNot({ id: userId })
+        .first();
       if (existing) {
-        return res.status(409).json({ status: 'ERROR', message: 'Email already in use' });
+        return res
+          .status(409)
+          .json({ status: "ERROR", message: "Email already in use" });
       }
       updates.email = email.toLowerCase().trim();
     }
 
     if (phoneNumber) {
-      const existingPhone = await db('users').where({ phone_number: phoneNumber }).andWhereNot({ id: userId }).first();
+      const existingPhone = await db("users")
+        .where({ phone_number: phoneNumber })
+        .andWhereNot({ id: userId })
+        .first();
       if (existingPhone) {
-        return res.status(409).json({ status: 'ERROR', message: 'Phone number already in use' });
+        return res
+          .status(409)
+          .json({ status: "ERROR", message: "Phone number already in use" });
       }
       updates.phone_number = phoneNumber;
     }
 
     if (role) {
-      if (!['user', 'admin'].includes(role)) {
-        return res.status(400).json({ status: 'ERROR', message: 'Invalid role' });
+      if (!["user", "admin"].includes(role)) {
+        return res
+          .status(400)
+          .json({ status: "ERROR", message: "Invalid role" });
       }
       updates.role = role;
     }
 
-    if (typeof isActive === 'boolean') {
+    if (typeof isActive === "boolean") {
       updates.is_active = isActive;
     }
 
+    if (typeof withdrawalDisabled === "boolean") {
+      updates.withdrawal_disabled = withdrawalDisabled;
+    }
+
     if (password) {
-      if (typeof password !== 'string' || password.length < 8) {
-        return res.status(400).json({ status: 'ERROR', message: 'Password must be at least 8 characters' });
+      if (typeof password !== "string" || password.length < 8) {
+        return res.status(400).json({
+          status: "ERROR",
+          message: "Password must be at least 8 characters",
+        });
       }
       updates.password = await bcrypt.hash(password, 10);
     }
 
     if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ status: 'ERROR', message: 'No updates provided' });
+      return res
+        .status(400)
+        .json({ status: "ERROR", message: "No updates provided" });
     }
 
-    await db('users').where({ id: userId }).update({ ...updates, updated_at: new Date() });
-    const updatedUser = await db('users').where({ id: userId }).first();
+    await db("users")
+      .where({ id: userId })
+      .update({ ...updates, updated_at: new Date() });
+    const updatedUser = await db("users").where({ id: userId }).first();
 
-    logger.info('Admin updated user', { adminId: req.user.id, userId, updates: Object.keys(updates) });
+    logger.info("Admin updated user", {
+      adminId: req.user.id,
+      userId,
+      updates: Object.keys(updates),
+    });
 
-    return res.json({ status: 'SUCCESS', data: { user: updatedUser } });
+    return res.json({ status: "SUCCESS", data: { user: updatedUser } });
   } catch (error) {
-    logger.error('Update user (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to update user' });
+    logger.error("Update user (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to update user" });
   }
 };
 
@@ -309,25 +494,35 @@ const updateUser = async (req, res) => {
 const removeUser2FA = async (req, res) => {
   try {
     const { userId } = req.params;
-    const user = await db('users').where({ id: userId }).first();
+    const user = await db("users").where({ id: userId }).first();
     if (!user) {
-      return res.status(404).json({ status: 'ERROR', message: 'User not found' });
+      return res
+        .status(404)
+        .json({ status: "ERROR", message: "User not found" });
     }
 
     await db.transaction(async (trx) => {
-      await trx('two_factor_auth')
-        .where({ user_id: userId })
-        .update({ is_enabled: false, enabled_at: null, secret: null, updated_at: trx.fn.now() });
+      await trx("two_factor_auth").where({ user_id: userId }).update({
+        is_enabled: false,
+        enabled_at: null,
+        secret: null,
+        updated_at: trx.fn.now(),
+      });
 
-      await trx('backup_codes').where({ user_id: userId }).delete();
+      await trx("backup_codes").where({ user_id: userId }).delete();
     });
 
-    logger.info('Admin removed user 2FA', { adminId: req.user.id, userId });
+    logger.info("Admin removed user 2FA", { adminId: req.user.id, userId });
 
-    return res.json({ status: 'SUCCESS', message: '2FA removed for user' });
+    return res.json({ status: "SUCCESS", message: "2FA removed for user" });
   } catch (error) {
-    logger.error('Remove user 2FA (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to remove 2FA' });
+    logger.error("Remove user 2FA (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to remove 2FA" });
   }
 };
 
@@ -339,12 +534,16 @@ const manualDepositToUser = async (req, res) => {
     const depositAmount = parseFloat(amount);
 
     if (!depositAmount || Number.isNaN(depositAmount) || depositAmount <= 0) {
-      return res.status(400).json({ status: 'ERROR', message: 'Valid amount is required' });
+      return res
+        .status(400)
+        .json({ status: "ERROR", message: "Valid amount is required" });
     }
 
-    const user = await db('users').where({ id: userId }).first();
+    const user = await db("users").where({ id: userId }).first();
     if (!user) {
-      return res.status(404).json({ status: 'ERROR', message: 'User not found' });
+      return res
+        .status(404)
+        .json({ status: "ERROR", message: "User not found" });
     }
 
     // Ensure wallet exists
@@ -354,56 +553,66 @@ const manualDepositToUser = async (req, res) => {
     let createdTransaction = null;
 
     await db.transaction(async (trx) => {
-      const insertResult = await trx('transactions').insert({
+      const insertResult = await trx("transactions").insert({
         user_id: userId,
-        wallet_type: 'main',
-        transaction_type: 'deposit',
-        reference_type: 'manual_admin',
+        wallet_type: "main",
+        transaction_type: "deposit",
+        reference_type: "manual_admin",
         reference_id: referenceId,
         amount: depositAmount,
         fee: 0,
-        currency: 'USD',
-        status: 'completed',
+        currency: "USD",
+        status: "completed",
         description: description || `Manual deposit by admin ${req.user.id}`,
         metadata: JSON.stringify({
           adminId: req.user.id,
           description,
-          source: 'admin_manual_deposit'
+          source: "admin_manual_deposit",
         }),
         created_at: trx.fn.now(),
-        updated_at: trx.fn.now()
+        updated_at: trx.fn.now(),
       });
 
-      let transactionRow = Array.isArray(insertResult) ? insertResult[0] : insertResult;
+      let transactionRow = Array.isArray(insertResult)
+        ? insertResult[0]
+        : insertResult;
 
       // MySQL returns insert id; fetch the row if needed
-      if (!transactionRow || typeof transactionRow === 'number') {
-        const insertedId = typeof transactionRow === 'number' ? transactionRow : insertResult;
-        transactionRow = await trx('transactions').where({ id: insertedId }).first();
+      if (!transactionRow || typeof transactionRow === "number") {
+        const insertedId =
+          typeof transactionRow === "number" ? transactionRow : insertResult;
+        transactionRow = await trx("transactions")
+          .where({ id: insertedId })
+          .first();
       }
 
-      await Wallet.updateBalance(userId, depositAmount, 'add', 'main', trx);
+      await Wallet.updateBalance(userId, depositAmount, "add", "main", trx);
 
       createdTransaction = transactionRow;
     });
 
-    logger.info('Admin manual deposit completed', {
+    logger.info("Admin manual deposit completed", {
       adminId: req.user.id,
       userId,
       amount: depositAmount,
-      referenceId
+      referenceId,
     });
 
     return res.json({
-      status: 'SUCCESS',
-      message: 'Manual deposit completed',
+      status: "SUCCESS",
+      message: "Manual deposit completed",
       data: {
-        transaction: createdTransaction
-      }
+        transaction: createdTransaction,
+      },
     });
   } catch (error) {
-    logger.error('Manual deposit (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to process manual deposit' });
+    logger.error("Manual deposit (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to process manual deposit" });
   }
 };
 
@@ -415,16 +624,21 @@ const getUserWalletBalance = async (req, res) => {
     const balances = await Wallet.getBothBalances(userId);
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         wallet: wallet.main,
         balance: balances.main,
-        total_balance: balances.main
-      }
+        total_balance: balances.main,
+      },
     });
   } catch (error) {
-    logger.error('Get user wallet (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch user wallet' });
+    logger.error("Get user wallet (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch user wallet" });
   }
 };
 
@@ -433,14 +647,19 @@ const getNowPaymentsStatus = async (_req, res) => {
   try {
     const status = await NowPaymentService.testApiConnection();
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
-        nowpayments: status
-      }
+        nowpayments: status,
+      },
     });
   } catch (error) {
-    logger.error('NowPayments status check failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch NowPayments status' });
+    logger.error("NowPayments status check failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch NowPayments status" });
   }
 };
 
@@ -449,14 +668,19 @@ const getNowPaymentsBalance = async (_req, res) => {
   try {
     const balance = await NowPaymentService.getBalance();
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
-        nowpayments: balance
-      }
+        nowpayments: balance,
+      },
     });
   } catch (error) {
-    logger.error('NowPayments balance check failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch balance' });
+    logger.error("NowPayments balance check failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch balance" });
   }
 };
 
@@ -464,61 +688,103 @@ const getNowPaymentsBalance = async (_req, res) => {
 const requeryDepositStatus = async (req, res) => {
   try {
     const { transactionId } = req.params;
-    const transaction = await db('transactions').where({ id: transactionId, transaction_type: 'deposit' }).first();
+    const transaction = await db("transactions")
+      .where({ id: transactionId, transaction_type: "deposit" })
+      .first();
 
     if (!transaction) {
-      return res.status(404).json({ status: 'ERROR', message: 'Deposit transaction not found' });
+      return res
+        .status(404)
+        .json({ status: "ERROR", message: "Deposit transaction not found" });
     }
 
     const metadata = parseMetadata(transaction.metadata);
-    const paymentId = metadata.payment_id || metadata.paymentId || metadata.payment_id || metadata.payment?.payment_id;
+    const paymentId =
+      metadata.payment_id ||
+      metadata.paymentId ||
+      metadata.payment_id ||
+      metadata.payment?.payment_id;
 
     if (!paymentId) {
-      return res.status(400).json({ status: 'ERROR', message: 'No payment_id found for this transaction' });
+      return res.status(400).json({
+        status: "ERROR",
+        message: "No payment_id found for this transaction",
+      });
     }
 
     const paymentStatus = await NowPaymentService.getPaymentStatus(paymentId);
-    const processed = await NowPaymentService.processDepositCallback(paymentStatus);
+    const processed = await NowPaymentService.processDepositCallback(
+      paymentStatus
+    );
 
     const updatedMetadata = {
       ...metadata,
       last_requery_at: new Date().toISOString(),
       last_requery_status: processed.status,
-      raw_status: paymentStatus
+      raw_status: paymentStatus,
     };
 
-    const desiredStatus = mapDepositStatus(paymentStatus.payment_status || paymentStatus.status || processed.status);
+    const desiredStatus = mapDepositStatus(
+      paymentStatus.payment_status || paymentStatus.status || processed.status
+    );
 
     // Only credit wallet if moving from non-completed to completed
-    if ((desiredStatus === 'completed' || desiredStatus === 'partially_paid') && transaction.status !== 'completed') {
-      const creditAmount = parseFloat(processed.price_amount || transaction.amount || 0);
+    if (
+      (desiredStatus === "completed" || desiredStatus === "partially_paid") &&
+      transaction.status !== "completed"
+    ) {
+      const creditAmount = parseFloat(
+        processed.price_amount || transaction.amount || 0
+      );
 
       await db.transaction(async (trx) => {
-        await Transaction.updateStatus(transaction.id, 'completed', updatedMetadata, trx);
+        await Transaction.updateStatus(
+          transaction.id,
+          "completed",
+          updatedMetadata,
+          trx
+        );
         if (creditAmount > 0) {
-          await Wallet.updateBalance(transaction.user_id, creditAmount, 'add', 'main', trx);
+          await Wallet.updateBalance(
+            transaction.user_id,
+            creditAmount,
+            "add",
+            "main",
+            trx
+          );
         }
       });
     } else {
-      if (transaction.status === 'completed' && desiredStatus === 'completed') {
+      if (transaction.status === "completed" && desiredStatus === "completed") {
         await Transaction.update(transaction.id, { metadata: updatedMetadata });
       } else {
-        await Transaction.updateStatus(transaction.id, desiredStatus, updatedMetadata);
+        await Transaction.updateStatus(
+          transaction.id,
+          desiredStatus,
+          updatedMetadata
+        );
       }
     }
 
-    const refreshedTx = await db('transactions').where({ id: transactionId }).first();
+    const refreshedTx = await db("transactions")
+      .where({ id: transactionId })
+      .first();
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         transaction: refreshedTx,
-        nowpayments: paymentStatus
-      }
+        nowpayments: paymentStatus,
+      },
     });
   } catch (error) {
-    logger.error('Requery deposit (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to requery deposit' });
+    logger.error("Requery deposit (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to requery deposit" });
   }
 };
 
@@ -526,82 +792,127 @@ const requeryDepositStatus = async (req, res) => {
 const requeryWithdrawalStatus = async (req, res) => {
   try {
     const { transactionId } = req.params;
-    const transaction = await db('transactions').where({ id: transactionId, transaction_type: 'withdraw' }).first();
+    const transaction = await db("transactions")
+      .where({ id: transactionId, transaction_type: "withdraw" })
+      .first();
 
     if (!transaction) {
-      return res.status(404).json({ status: 'ERROR', message: 'Withdrawal transaction not found' });
+      return res
+        .status(404)
+        .json({ status: "ERROR", message: "Withdrawal transaction not found" });
     }
 
     const metadata = parseMetadata(transaction.metadata);
-    const payoutId = metadata.payout?.id || metadata.payout_id || metadata.payoutId || transaction.reference_id;
+    const payoutId =
+      metadata.payout?.id ||
+      metadata.payout_id ||
+      metadata.payoutId ||
+      transaction.reference_id;
 
     if (!payoutId) {
-      return res.status(400).json({ status: 'ERROR', message: 'No payout identifier found for this transaction' });
+      return res.status(400).json({
+        status: "ERROR",
+        message: "No payout identifier found for this transaction",
+      });
     }
 
     const payoutStatus = await NowPaymentService.getPayoutStatus(payoutId);
-    const desiredStatus = mapPayoutStatus(payoutStatus.status || payoutStatus.payout_status);
+    const desiredStatus = mapPayoutStatus(
+      payoutStatus.status || payoutStatus.payout_status
+    );
 
     const updatedMetadata = {
       ...metadata,
       last_requery_at: new Date().toISOString(),
       last_requery_status: desiredStatus,
-      raw_status: payoutStatus
+      raw_status: payoutStatus,
     };
 
-    if (desiredStatus === 'failed' && transaction.status !== 'failed') {
-      const alreadyRefunded = updatedMetadata.refunded || updatedMetadata.refunded_at;
+    if (desiredStatus === "failed" && transaction.status !== "failed") {
+      const alreadyRefunded =
+        updatedMetadata.refunded || updatedMetadata.refunded_at;
       if (!alreadyRefunded) {
-        const totalDebit = Math.abs(parseFloat(transaction.amount || 0)) + Math.abs(parseFloat(transaction.fee || 0));
+        const totalDebit =
+          Math.abs(parseFloat(transaction.amount || 0)) +
+          Math.abs(parseFloat(transaction.fee || 0));
 
         await db.transaction(async (trx) => {
           updatedMetadata.refunded = true;
           updatedMetadata.refunded_at = new Date().toISOString();
 
-          await Transaction.updateStatus(transaction.id, 'failed', updatedMetadata, trx);
+          await Transaction.updateStatus(
+            transaction.id,
+            "failed",
+            updatedMetadata,
+            trx
+          );
 
           if (totalDebit > 0) {
-            await Wallet.updateBalance(transaction.user_id, totalDebit, 'add', 'main', trx);
-            await trx('transactions').insert({
+            await Wallet.updateBalance(
+              transaction.user_id,
+              totalDebit,
+              "add",
+              "main",
+              trx
+            );
+            await trx("transactions").insert({
               user_id: transaction.user_id,
-              wallet_type: 'main',
-              transaction_type: 'withdraw_refund',
-              reference_type: 'withdraw_requery',
+              wallet_type: "main",
+              transaction_type: "withdraw_refund",
+              reference_type: "withdraw_requery",
               reference_id: `REFUND-${transaction.id}-${Date.now()}`,
               amount: totalDebit,
               fee: 0,
-              currency: 'USD',
-              status: 'completed',
+              currency: "USD",
+              status: "completed",
               description: `Refund for failed withdrawal ${transaction.id}`,
               metadata: JSON.stringify({
                 original_transaction_id: transaction.id,
                 payout_status: payoutStatus,
-                admin_requery: true
+                admin_requery: true,
               }),
               created_at: trx.fn.now(),
-              updated_at: trx.fn.now()
+              updated_at: trx.fn.now(),
             });
           }
         });
       }
-    } else if (desiredStatus === 'completed' && transaction.status !== 'completed') {
-      await Transaction.updateStatus(transaction.id, 'completed', updatedMetadata);
+    } else if (
+      desiredStatus === "completed" &&
+      transaction.status !== "completed"
+    ) {
+      await Transaction.updateStatus(
+        transaction.id,
+        "completed",
+        updatedMetadata
+      );
     } else {
-      await Transaction.updateStatus(transaction.id, desiredStatus, updatedMetadata);
+      await Transaction.updateStatus(
+        transaction.id,
+        desiredStatus,
+        updatedMetadata
+      );
     }
 
-    const refreshedTx = await db('transactions').where({ id: transactionId }).first();
+    const refreshedTx = await db("transactions")
+      .where({ id: transactionId })
+      .first();
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         transaction: refreshedTx,
-        nowpayments: payoutStatus
-      }
+        nowpayments: payoutStatus,
+      },
     });
   } catch (error) {
-    logger.error('Requery withdrawal (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to requery withdrawal' });
+    logger.error("Requery withdrawal (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to requery withdrawal" });
   }
 };
 
@@ -613,26 +924,25 @@ const listStakes = async (req, res) => {
     const offset = (page - 1) * limit;
     const { status, pack_type: packType, user_id: userId, search } = req.query;
 
-    const baseQuery = db('stakes as s')
-      .join('users as u', 's.user_id', 'u.id');
+    const baseQuery = db("stakes as s").join("users as u", "s.user_id", "u.id");
 
     if (status) {
-      baseQuery.andWhere('s.status', status);
+      baseQuery.andWhere("s.status", status);
     }
 
     if (packType) {
-      baseQuery.andWhere('s.pack_type', packType);
+      baseQuery.andWhere("s.pack_type", packType);
     }
 
     if (userId) {
-      baseQuery.andWhere('s.user_id', userId);
+      baseQuery.andWhere("s.user_id", userId);
     }
 
     if (search) {
       baseQuery.andWhere((qb) => {
-        qb.where('u.phone_number', 'like', `%${search}%`)
-          .orWhere('u.email', 'like', `%${search}%`)
-          .orWhere('u.name', 'like', `%${search}%`);
+        qb.where("u.phone_number", "like", `%${search}%`)
+          .orWhere("u.email", "like", `%${search}%`)
+          .orWhere("u.name", "like", `%${search}%`);
       });
     }
 
@@ -640,32 +950,37 @@ const listStakes = async (req, res) => {
       baseQuery
         .clone()
         .select(
-          's.*',
-          'u.name as user_name',
-          'u.email as user_email',
-          'u.phone_number as user_phone'
+          "s.*",
+          "u.name as user_name",
+          "u.email as user_email",
+          "u.phone_number as user_phone"
         )
-        .orderBy('s.created_at', 'desc')
+        .orderBy("s.created_at", "desc")
         .limit(limit)
         .offset(offset),
-      baseQuery.clone().count('* as count')
+      baseQuery.clone().count("* as count"),
     ]);
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         stakes: rows,
         pagination: {
           page,
           limit,
           total: parseInt(count, 10) || 0,
-          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
-        }
-      }
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit),
+        },
+      },
     });
   } catch (error) {
-    logger.error('List stakes (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch stakes' });
+    logger.error("List stakes (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch stakes" });
   }
 };
 
@@ -676,29 +991,42 @@ const getPairingGenealogy = async (req, res) => {
 
     if (!userId) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'userId parameter is required'
+        status: "ERROR",
+        message: "userId parameter is required",
       });
     }
 
     // Build pairing genealogy tree (binary tree)
-    const pairingTree = await buildPairingTree(parseInt(userId), parseInt(depth));
+    const pairingTree = await buildPairingTree(
+      parseInt(userId),
+      parseInt(depth)
+    );
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         userId: parseInt(userId),
-        pairingTree
-      }
+        pairingTree,
+      },
     });
   } catch (error) {
-    logger.error('Get pairing genealogy (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch pairing genealogy' });
+    logger.error("Get pairing genealogy (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch pairing genealogy" });
   }
 };
 
 // Helper function to build pairing genealogy tree (binary tree based on parent/position)
-async function buildPairingTree(rootUserId, maxDepth = 10, currentDepth = 0, visited = new Set()) {
+async function buildPairingTree(
+  rootUserId,
+  maxDepth = 10,
+  currentDepth = 0,
+  visited = new Set()
+) {
   if (currentDepth >= maxDepth) return null;
 
   // Prevent cycles
@@ -706,37 +1034,37 @@ async function buildPairingTree(rootUserId, maxDepth = 10, currentDepth = 0, vis
   visited.add(rootUserId);
 
   // Get user details
-  const user = await db('users')
-    .where('id', rootUserId)
-    .select('id', 'name', 'email', 'phone_number', 'created_at')
+  const user = await db("users")
+    .where("id", rootUserId)
+    .select("id", "name", "email", "phone_number", "created_at")
     .first();
 
   if (!user) return null;
 
   // Get left and right children
-  const leftChild = await db('genealogy')
-    .where('parent_id', rootUserId)
-    .where('position', 'left')
-    .join('users', 'genealogy.user_id', 'users.id')
+  const leftChild = await db("genealogy")
+    .where("parent_id", rootUserId)
+    .where("position", "left")
+    .join("users", "genealogy.user_id", "users.id")
     .select(
-      'genealogy.user_id as id',
-      'users.name',
-      'users.email',
-      'users.phone_number',
-      'users.created_at'
+      "genealogy.user_id as id",
+      "users.name",
+      "users.email",
+      "users.phone_number",
+      "users.created_at"
     )
     .first();
 
-  const rightChild = await db('genealogy')
-    .where('parent_id', rootUserId)
-    .where('position', 'right')
-    .join('users', 'genealogy.user_id', 'users.id')
+  const rightChild = await db("genealogy")
+    .where("parent_id", rootUserId)
+    .where("position", "right")
+    .join("users", "genealogy.user_id", "users.id")
     .select(
-      'genealogy.user_id as id',
-      'users.name',
-      'users.email',
-      'users.phone_number',
-      'users.created_at'
+      "genealogy.user_id as id",
+      "users.name",
+      "users.email",
+      "users.phone_number",
+      "users.created_at"
     )
     .first();
 
@@ -747,8 +1075,22 @@ async function buildPairingTree(rootUserId, maxDepth = 10, currentDepth = 0, vis
     email: user.email,
     phone_number: user.phone_number,
     joined_at: user.created_at,
-    left: leftChild ? await buildPairingTree(leftChild.id, maxDepth, currentDepth + 1, new Set(visited)) : null,
-    right: rightChild ? await buildPairingTree(rightChild.id, maxDepth, currentDepth + 1, new Set(visited)) : null
+    left: leftChild
+      ? await buildPairingTree(
+          leftChild.id,
+          maxDepth,
+          currentDepth + 1,
+          new Set(visited)
+        )
+      : null,
+    right: rightChild
+      ? await buildPairingTree(
+          rightChild.id,
+          maxDepth,
+          currentDepth + 1,
+          new Set(visited)
+        )
+      : null,
   };
 
   return node;
@@ -762,23 +1104,23 @@ const listManualDeposits = async (req, res) => {
     const offset = (page - 1) * limit;
     const { status, user_id: userId, search } = req.query;
 
-    const baseQuery = db('transactions as t')
-      .join('users as u', 't.user_id', 'u.id')
-      .where('t.reference_type', 'manual_deposit');
+    const baseQuery = db("transactions as t")
+      .join("users as u", "t.user_id", "u.id")
+      .where("t.reference_type", "manual_deposit");
 
     if (status) {
-      baseQuery.andWhere('t.status', status);
+      baseQuery.andWhere("t.status", status);
     }
 
     if (userId) {
-      baseQuery.andWhere('t.user_id', userId);
+      baseQuery.andWhere("t.user_id", userId);
     }
 
     if (search) {
       baseQuery.andWhere((qb) => {
-        qb.where('u.phone_number', 'like', `%${search}%`)
-          .orWhere('u.email', 'like', `%${search}%`)
-          .orWhere('u.name', 'like', `%${search}%`);
+        qb.where("u.phone_number", "like", `%${search}%`)
+          .orWhere("u.email", "like", `%${search}%`)
+          .orWhere("u.name", "like", `%${search}%`);
       });
     }
 
@@ -786,37 +1128,42 @@ const listManualDeposits = async (req, res) => {
       baseQuery
         .clone()
         .select(
-          't.*',
-          'u.name as user_name',
-          'u.email as user_email',
-          'u.phone_number as user_phone'
+          "t.*",
+          "u.name as user_name",
+          "u.email as user_email",
+          "u.phone_number as user_phone"
         )
-        .orderBy('t.created_at', 'desc')
+        .orderBy("t.created_at", "desc")
         .limit(limit)
         .offset(offset),
-      baseQuery.clone().count('* as count')
+      baseQuery.clone().count("* as count"),
     ]);
 
     const transactions = rows.map((row) => ({
       ...row,
-      metadata: parseMetadata(row.metadata)
+      metadata: parseMetadata(row.metadata),
     }));
 
     return res.json({
-      status: 'SUCCESS',
+      status: "SUCCESS",
       data: {
         deposits: transactions,
         pagination: {
           page,
           limit,
           total: parseInt(count, 10) || 0,
-          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit)
-        }
-      }
+          total_pages: Math.ceil((parseInt(count, 10) || 0) / limit),
+        },
+      },
     });
   } catch (error) {
-    logger.error('List manual deposits (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to fetch manual deposits' });
+    logger.error("List manual deposits (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to fetch manual deposits" });
   }
 };
 
@@ -826,109 +1173,249 @@ const processManualDepositAdmin = async (req, res) => {
     const { transaction_id } = req.params;
     const { action, admin_note } = req.body;
 
-    if (!action || !['approve', 'reject'].includes(action)) {
+    if (!action || !["approve", "reject"].includes(action)) {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'Invalid action. Must be "approve" or "reject"'
+        status: "ERROR",
+        message: 'Invalid action. Must be "approve" or "reject"',
       });
     }
 
     // Find transaction
-    const transaction = await db('transactions').where('id', transaction_id).first();
+    const transaction = await db("transactions")
+      .where("id", transaction_id)
+      .first();
     if (!transaction) {
       return res.status(404).json({
-        status: 'ERROR',
-        message: 'Transaction not found'
+        status: "ERROR",
+        message: "Transaction not found",
       });
     }
 
-    if (transaction.reference_type !== 'manual_deposit') {
+    if (transaction.reference_type !== "manual_deposit") {
       return res.status(400).json({
-        status: 'ERROR',
-        message: 'This is not a manual deposit transaction'
+        status: "ERROR",
+        message: "This is not a manual deposit transaction",
       });
     }
 
-    if (transaction.status !== 'pending') {
+    if (transaction.status !== "pending") {
       return res.status(400).json({
-        status: 'ERROR',
-        message: `Transaction has already been ${transaction.status}`
+        status: "ERROR",
+        message: `Transaction has already been ${transaction.status}`,
       });
     }
 
     // Helper to safely parse metadata
     const existingMetadata = parseMetadata(transaction.metadata);
 
-    if (action === 'approve') {
+    if (action === "approve") {
       // Use database transaction for atomicity
       await db.transaction(async (trx) => {
         // Update transaction status to completed
-        await trx('transactions')
-          .where('id', transaction_id)
+        await trx("transactions")
+          .where("id", transaction_id)
           .update({
-            status: 'completed',
+            status: "completed",
             metadata: JSON.stringify({
               ...existingMetadata,
               approved_at: new Date().toISOString(),
               approved_by: req.user.id,
-              admin_note: admin_note || null
+              admin_note: admin_note || null,
             }),
-            updated_at: trx.fn.now()
+            updated_at: trx.fn.now(),
           });
 
         // Update wallet balance
-        await Wallet.updateBalance(transaction.user_id, parseFloat(transaction.amount), 'add', 'main', trx);
+        await Wallet.updateBalance(
+          transaction.user_id,
+          parseFloat(transaction.amount),
+          "add",
+          "main",
+          trx
+        );
       });
 
-      logger.info('Admin approved manual deposit', {
+      logger.info("Admin approved manual deposit", {
         adminId: req.user.id,
         transactionId: transaction_id,
         userId: transaction.user_id,
-        amount: transaction.amount
+        amount: transaction.amount,
       });
 
       return res.json({
-        status: 'SUCCESS',
-        message: 'Manual deposit approved and wallet credited',
+        status: "SUCCESS",
+        message: "Manual deposit approved and wallet credited",
         data: {
           transaction_id: transaction_id,
           user_id: transaction.user_id,
-          amount: transaction.amount
-        }
+          amount: transaction.amount,
+        },
       });
     } else {
       // Reject the transaction
-      await db('transactions')
-        .where('id', transaction_id)
+      await db("transactions")
+        .where("id", transaction_id)
         .update({
-          status: 'rejected',
+          status: "rejected",
           metadata: JSON.stringify({
             ...existingMetadata,
             rejected_at: new Date().toISOString(),
             rejected_by: req.user.id,
-            admin_note: admin_note || null
+            admin_note: admin_note || null,
           }),
-          updated_at: db.fn.now()
+          updated_at: db.fn.now(),
         });
 
-      logger.info('Admin rejected manual deposit', {
+      logger.info("Admin rejected manual deposit", {
         adminId: req.user.id,
         transactionId: transaction_id,
         userId: transaction.user_id,
-        amount: transaction.amount
+        amount: transaction.amount,
       });
 
       return res.json({
-        status: 'SUCCESS',
-        message: 'Manual deposit rejected',
+        status: "SUCCESS",
+        message: "Manual deposit rejected",
         data: {
-          transaction_id: transaction_id
-        }
+          transaction_id: transaction_id,
+        },
       });
     }
   } catch (error) {
-    logger.error('Process manual deposit (admin) failed', { error: error.message, stack: error.stack });
-    return res.status(500).json({ status: 'ERROR', message: 'Failed to process manual deposit' });
+    logger.error("Process manual deposit (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to process manual deposit" });
+  }
+};
+
+// Admin: Create free stake for user
+const createFreeStake = async (req, res) => {
+  try {
+    const { user_id, amount } = req.body;
+
+    // Validate required fields
+    if (!user_id || !amount) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "user_id and amount are required",
+      });
+    }
+
+    const numAmount = parseFloat(amount);
+    if (numAmount <= 0) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "Invalid amount",
+      });
+    }
+
+    // Verify user exists
+    const user = await db("users").where({ id: user_id }).first();
+    if (!user) {
+      return res.status(404).json({
+        status: "ERROR",
+        message: "User not found",
+      });
+    }
+
+    // Calculate shares and determine pack type (same as regular stake creation)
+    const shares = Math.floor(numAmount / 25);
+    if (shares < 1) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "Minimum stake amount is $25 (1 share)",
+      });
+    }
+
+    const packType = Stake.getPackForShares(shares);
+    if (!packType) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "Invalid share count. Minimum 1 share required.",
+      });
+    }
+
+    // Validate pack type and amount
+    const validation = Stake.validateStakeAmount(packType, numAmount);
+    if (!validation.valid) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: validation.error,
+      });
+    }
+
+    // Create free stake (no wallet deduction)
+    const result = await db.transaction(async (trx) => {
+      const stake = await Stake.createWithTransaction(
+        {
+          user_id: user_id,
+          pack_type: packType,
+          amount: numAmount,
+          is_free: true,
+        },
+        trx
+      );
+
+      if (!stake || !stake.id) {
+        throw new Error("Failed to create free stake - no ID returned");
+      }
+
+      // Create transaction record (no amount deduction, just record the free stake)
+      await trx("transactions").insert({
+        user_id: user_id,
+        wallet_type: "main",
+        transaction_type: "stake",
+        reference_type: "stake",
+        reference_id: stake.id.toString(),
+        amount: 0, // No wallet deduction for free stakes
+        currency: "USD",
+        status: "completed",
+        description: `Free stake created: ${shares} share${
+          shares > 1 ? "s" : ""
+        } (${packType} pack)`,
+        created_at: trx.fn.now(),
+        updated_at: trx.fn.now(),
+      });
+
+      // Distribute Catalyst Bonus up the referral chain (even for free stakes)
+      const catalystStats = await distributeCatalystBonus({
+        originUserId: user_id,
+        amount: numAmount,
+        referenceId: stake.id,
+        trx,
+      });
+
+      // Add volume to Synergy Flow (binary) uplines
+      await Synergy.addVolumeToUplines(user_id, numAmount, trx, true);
+
+      return { stake, catalystStats };
+    });
+
+    // Fire-and-forget rank promotion checks for staker and sponsor chain
+    triggerRankPromotionChain(user_id);
+
+    res.status(200).json({
+      status: "SUCCESS",
+      message: `Successfully created free stake: ${shares} share${
+        shares > 1 ? "s" : ""
+      } for ${packType} pack`,
+      data: {
+        stake: result.stake,
+        catalyst: result.catalystStats,
+      },
+    });
+  } catch (error) {
+    logger.error("Create free stake (admin) failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return res
+      .status(500)
+      .json({ status: "ERROR", message: "Failed to create free stake" });
   }
 };
 
@@ -947,7 +1434,6 @@ module.exports = {
   requeryWithdrawalStatus,
   getPairingGenealogy,
   listManualDeposits,
-  processManualDepositAdmin
+  processManualDepositAdmin,
+  createFreeStake,
 };
-
-
