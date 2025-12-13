@@ -1384,7 +1384,7 @@ const createFreeStake = async (req, res) => {
       // Add volume to Synergy Flow (binary) uplines
       await Synergy.addVolumeToUplines(user_id, numAmount, trx, true);
 
-      return { stake, catalystStats };
+      return { stake };
     });
 
     // Fire-and-forget rank promotion checks for staker and sponsor chain
