@@ -654,39 +654,132 @@ const handleDepositCallback = async (req, res) => {
     ) {
       // Payment received - credit the wallet
       await db.transaction(async (trx) => {
-        // Determine the USD amount to credit
-        const expectedAmount = parseFloat(transaction.amount || 0);
-        const creditAmount = parseFloat(
-          processedData.price_amount || expectedAmount || 0
-        );
+        // Determine the USD amount to credit (Meta-Unity approach)
+        let creditAmount = 0;
+        let amountSource = "";
+
+        if (processedData.status === "completed") {
+          // COMPLETED: User paid in full, credit the expected amount
+          creditAmount = parseFloat(processedData.price_amount || 0);
+          amountSource = "price_amount (fully paid)";
+          console.log(
+            `IXFLIX Deposit ${
+              transaction.id
+            }: Payment completed - crediting full amount: $${creditAmount.toFixed(
+              2
+            )} USD`
+          );
+        } else if (processedData.status === "partially_paid") {
+          // PARTIALLY PAID: Calculate net amount after fees (Meta-Unity approach)
+          const grossUSD = parseFloat(processedData.actually_paid_at_fiat || 0);
+          const depositFeeUSDT = parseFloat(processedData.fee?.depositFee || 0);
+          const serviceFeeUSDT = parseFloat(processedData.fee?.serviceFee || 0);
+          const totalFeesUSDT = depositFeeUSDT + serviceFeeUSDT;
+          const totalFeesUSD = totalFeesUSDT; // 1:1 conversion for USDT stablecoin
+
+          if (grossUSD > 0) {
+            // Calculate net USD amount: gross USD - fees in USD
+            creditAmount = grossUSD - totalFeesUSD;
+            amountSource = "actually_paid_at_fiat minus fees";
+            console.log(
+              `IXFLIX Deposit ${
+                transaction.id
+              }: Partial payment - calculating net USD: Gross=$${grossUSD.toFixed(
+                2
+              )} - Fees=$${totalFeesUSD.toFixed(
+                2
+              )} = Net=$${creditAmount.toFixed(2)} USD`
+            );
+          } else if (
+            processedData.outcome_amount &&
+            parseFloat(processedData.outcome_amount) > 0
+          ) {
+            // Fallback: Use outcome_amount (in USDT) and treat as 1:1 with USD
+            creditAmount = parseFloat(processedData.outcome_amount);
+            amountSource = "outcome_amount (USDT treated as 1:1 USD)";
+            console.log(
+              `IXFLIX Deposit ${
+                transaction.id
+              }: Using outcome_amount: $${creditAmount.toFixed(
+                2
+              )} (USDT as USD fallback)`
+            );
+          } else if (
+            processedData.price_amount &&
+            parseFloat(processedData.price_amount) > 0
+          ) {
+            // Last resort: use expected price amount
+            creditAmount = parseFloat(processedData.price_amount);
+            amountSource = "price_amount (expected)";
+            console.log(
+              `IXFLIX Deposit ${
+                transaction.id
+              }: Using price_amount: $${creditAmount.toFixed(2)}`
+            );
+          }
+        }
 
         if (creditAmount > 0) {
+          // For partially_paid, update status to partially_paid, not completed
+          const finalStatus =
+            processedData.status === "partially_paid"
+              ? "partially_paid"
+              : "completed";
+
           // Mark transaction as completed with credited amount
           updatedMetadata.credited_amount = creditAmount;
+          updatedMetadata.amount_source = amountSource;
           updatedMetadata.credited_at = new Date().toISOString();
           updatedMetadata.payment_complete = true;
 
           await Transaction.updateStatus(
             transaction.id,
-            "completed",
+            finalStatus,
             updatedMetadata,
             trx
           );
 
-          // Credit the main wallet
+          // Credit the wallet (use wallet_type from transaction metadata)
+          const walletType = existingMetadata.wallet_type || "main";
           await Wallet.updateBalance(
             transaction.user_id,
             creditAmount,
             "add",
-            "main",
+            walletType,
             trx
           );
 
-          console.log(
-            `IXFLIX Deposit ${
-              transaction.id
-            } completed: Credited $${creditAmount.toFixed(2)} USD`
-          );
+          if (processedData.status === "completed") {
+            console.log(
+              `IXFLIX Deposit ${
+                transaction.id
+              } completed (full payment): Credited $${creditAmount.toFixed(
+                2
+              )} USD [${amountSource}]`
+            );
+          } else if (processedData.status === "partially_paid") {
+            const grossUSD = parseFloat(
+              processedData.actually_paid_at_fiat || 0
+            );
+            const totalFeesUSDT =
+              parseFloat(processedData.fee?.depositFee || 0) +
+              parseFloat(processedData.fee?.serviceFee || 0);
+            console.log(
+              `IXFLIX Deposit ${transaction.id} completed with partial payment:`
+            );
+            console.log(`  - Expected: $${processedData.price_amount} USD`);
+            console.log(
+              `  - Paid: ${
+                processedData.actually_paid
+              } USDT = $${grossUSD.toFixed(2)} USD`
+            );
+            console.log(`  - Fees: ${totalFeesUSDT.toFixed(6)} USDT`);
+            console.log(
+              `  - Net Credited: $${creditAmount.toFixed(
+                2
+              )} USD [${amountSource}]`
+            );
+          }
         } else {
           console.error(
             `IXFLIX Deposit ${transaction.id}: No valid amount to credit`

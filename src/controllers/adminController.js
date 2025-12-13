@@ -728,19 +728,62 @@ const requeryDepositStatus = async (req, res) => {
       paymentStatus.payment_status || paymentStatus.status || processed.status
     );
 
-    // Only credit wallet if moving from non-completed to completed
+    // Only credit wallet if moving from non-completed to completed/partially_paid
     if (
       (desiredStatus === "completed" || desiredStatus === "partially_paid") &&
-      transaction.status !== "completed"
+      transaction.status !== "completed" &&
+      transaction.status !== "partially_paid"
     ) {
-      const creditAmount = parseFloat(
-        processed.price_amount || transaction.amount || 0
-      );
+      // Determine the USD amount to credit (Meta-Unity approach)
+      let creditAmount = 0;
+      let amountSource = "";
+
+      if (desiredStatus === "completed") {
+        // COMPLETED: User paid in full, credit the expected amount
+        creditAmount = parseFloat(processed.price_amount || 0);
+        amountSource = "price_amount (fully paid)";
+      } else if (desiredStatus === "partially_paid") {
+        // PARTIALLY PAID: Calculate net amount after fees (Meta-Unity approach)
+        const grossUSD = parseFloat(processed.actually_paid_at_fiat || 0);
+        const depositFeeUSDT = parseFloat(processed.fee?.depositFee || 0);
+        const serviceFeeUSDT = parseFloat(processed.fee?.serviceFee || 0);
+        const totalFeesUSDT = depositFeeUSDT + serviceFeeUSDT;
+        const totalFeesUSD = totalFeesUSDT; // 1:1 conversion for USDT stablecoin
+
+        if (grossUSD > 0) {
+          // Calculate net USD amount: gross USD - fees in USD
+          creditAmount = grossUSD - totalFeesUSD;
+          amountSource = "actually_paid_at_fiat minus fees";
+        } else if (
+          processed.outcome_amount &&
+          parseFloat(processed.outcome_amount) > 0
+        ) {
+          // Fallback: Use outcome_amount (in USDT) and treat as 1:1 with USD
+          creditAmount = parseFloat(processed.outcome_amount);
+          amountSource = "outcome_amount (USDT treated as 1:1 USD)";
+        } else if (
+          processed.price_amount &&
+          parseFloat(processed.price_amount) > 0
+        ) {
+          // Last resort: use expected price amount
+          creditAmount = parseFloat(processed.price_amount);
+          amountSource = "price_amount (expected)";
+        }
+      }
 
       await db.transaction(async (trx) => {
+        // For partially_paid, keep the status as partially_paid, not completed
+        const finalStatus =
+          desiredStatus === "partially_paid" ? "partially_paid" : "completed";
+
+        updatedMetadata.credited_amount = creditAmount;
+        updatedMetadata.amount_source = amountSource;
+        updatedMetadata.credited_at = new Date().toISOString();
+        updatedMetadata.payment_complete = desiredStatus === "completed";
+
         await Transaction.updateStatus(
           transaction.id,
-          "completed",
+          finalStatus,
           updatedMetadata,
           trx
         );
