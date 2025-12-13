@@ -395,7 +395,7 @@ class Stake {
 
         // Calculate staker's entitled portion of core reward
         const { getUserRankPercent } = require('./PowerPassUp');
-        const stakerRankPercent = await getUserRankPercent(stake.user_id);
+        const stakerRankPercent = await getUserRankPercent(stake.user_id, trx);
         const stakerCorePortion = coreAmount * (stakerRankPercent / 100);
         const stakerTotalCredit = harvestAmount + stakerCorePortion;
 

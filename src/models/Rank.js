@@ -14,6 +14,14 @@ const RANK_LADDER = [
   { key: 'quantum', minDirects: 9, minPackValue: 50000, teamVolume: 2000000, percent: 100 },
 ];
 
+function unwrapRawRows(rawResult) {
+  // MySQL2 via Knex returns [rows, fields]
+  if (Array.isArray(rawResult)) return rawResult[0] || [];
+  // Postgres-style
+  if (rawResult && Array.isArray(rawResult.rows)) return rawResult.rows;
+  return rawResult || [];
+}
+
 async function ensureRankRow(userId, trx = null) {
   const query = trx || db;
   const existing = await query('user_ranks').where({ user_id: userId }).first();
@@ -46,29 +54,52 @@ async function getDirectReferralsCount(userId) {
 }
 
 async function getDownlineUserIds(userId) {
-  const queue = [userId];
-  const ids = [];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    const children = await db('genealogy')
-      .where({ sponsor_id: current })
-      .select('user_id');
-    for (const child of children) {
-      ids.push(child.user_id);
-      queue.push(child.user_id);
-    }
-  }
-  return ids;
+  const raw = await db.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT user_id
+        FROM genealogy
+        WHERE sponsor_id = ?
+
+        UNION ALL
+
+        SELECT g.user_id
+        FROM genealogy g
+        INNER JOIN downline d ON g.sponsor_id = d.user_id
+      )
+      SELECT user_id FROM downline
+    `,
+    [userId]
+  );
+
+  const rows = unwrapRawRows(raw);
+  return rows.map((r) => r.user_id);
 }
 
 async function getTeamSalesVolume(userId) {
-  const downlineIds = await getDownlineUserIds(userId);
-  if (downlineIds.length === 0) return 0;
-  const row = await db('stakes')
-    .whereIn('user_id', downlineIds)
-    .sum({ total: 'amount' })
-    .first();
-  return parseFloat(row?.total || 0);
+  const raw = await db.raw(
+    `
+      WITH RECURSIVE downline AS (
+        SELECT user_id
+        FROM genealogy
+        WHERE sponsor_id = ?
+
+        UNION ALL
+
+        SELECT g.user_id
+        FROM genealogy g
+        INNER JOIN downline d ON g.sponsor_id = d.user_id
+      )
+      SELECT COALESCE(SUM(s.amount), 0) AS total
+      FROM downline d
+      INNER JOIN stakes s ON s.user_id = d.user_id
+    `,
+    [userId]
+  );
+
+  const rows = unwrapRawRows(raw);
+  const total = rows?.[0]?.total;
+  return parseFloat(total || 0);
 }
 
 async function getHighestPackAmount(userId) {
