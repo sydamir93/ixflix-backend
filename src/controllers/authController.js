@@ -908,7 +908,7 @@ async function updateProfile(req, res) {
       .where({ user_id: userId, is_enabled: true })
       .first();
 
-    security.info("User profile updated", {
+    logger.info("User profile updated", {
       userId,
       updates: Object.keys(updates),
       ip: req.ip,
@@ -955,7 +955,7 @@ async function requestPasswordReset(req, res) {
 
     // Always return generic success to avoid enumeration
     if (!user) {
-      security.info("Password reset requested for unknown email", {
+      logger.info("Password reset requested for unknown email", {
         email,
         ip: req.ip,
       });
