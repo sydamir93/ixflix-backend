@@ -336,14 +336,15 @@ async function calculatePotentialPowerPassUp(userId, trx = db) {
 
 // Calculate potential Power Pass-Up bonuses user will RECEIVE when claiming their own pending rewards
 async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
-  // Find user's own pending stake rewards
-  const userPendingRewards = await trx('stake_rewards')
-    .whereIn('stake_id', function() {
-      this.select('id').from('stakes').where('user_id', userId).where('stakes.status', 'active');
-    })
-    .where('stake_rewards.status', 'pending')
-    .select('stake_rewards.*')
-    .join('stakes', 'stake_rewards.stake_id', '=', 'stakes.id');
+  // Find user's own pending stake rewards.
+  // Use a single indexed join (avoids WHERE IN subquery plans) and only select needed columns
+  // to reduce DB and JSON serialization overhead.
+  const userPendingRewards = await trx('stake_rewards as sr')
+    .join('stakes as s', 'sr.stake_id', 's.id')
+    .where('s.user_id', userId)
+    .where('s.status', 'active')
+    .where('sr.status', 'pending')
+    .select('sr.id', 'sr.core_reward', 'sr.reward_date');
 
   if (!userPendingRewards || userPendingRewards.length === 0) {
     return {
@@ -358,6 +359,27 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
   const chain = getSponsorChainFromMap(userId, sponsorByUserId, 9);
   const rankPercentByUserId = await buildRankPercentMap(chain, trx);
 
+  // Precompute the upline allocation "shape" once. For each reward, amounts scale linearly by core_reward.
+  // The total distributed percent equals the highest (strictly increasing) rank percent encountered in the chain.
+  const allocationPercents = [];
+  let totalOverridePercent = 0;
+  for (const sponsorId of chain) {
+    const sponsorRankPercent = Number(rankPercentByUserId.get(sponsorId) || 0);
+    if (sponsorRankPercent <= totalOverridePercent) continue;
+    const overridePercent = sponsorRankPercent - totalOverridePercent;
+    allocationPercents.push({ sponsorId, percent: overridePercent });
+    totalOverridePercent = sponsorRankPercent;
+  }
+
+  // If nobody in the upline has a higher rank percent than 0, then no pass-up would be distributed.
+  if (totalOverridePercent <= 0) {
+    return {
+      potentialReceivedBonuses: 0,
+      pendingRewardsCount: userPendingRewards.length,
+      receivedDetails: [],
+    };
+  }
+
   let totalPotentialReceived = 0;
   const receivedDetails = [];
 
@@ -366,22 +388,8 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
     const coreAmount = parseFloat(reward.core_reward);
     if (!coreAmount || coreAmount <= 0) continue;
 
-    // Simulate allocations using cached chain + rank percents (no DB calls)
-    const allocations = [];
-    let previousRankPercent = 0;
-
-    for (const sponsorId of chain) {
-      const sponsorRankPercent = Number(rankPercentByUserId.get(sponsorId) || 0);
-      if (sponsorRankPercent <= previousRankPercent) continue;
-      const overridePercent = sponsorRankPercent - previousRankPercent;
-      const amount = (overridePercent / 100) * coreAmount;
-      if (amount > 0) {
-        allocations.push({ sponsorId, percent: overridePercent, amount });
-      }
-      previousRankPercent = sponsorRankPercent;
-    }
-
-    const totalForThisReward = allocations.reduce((sum, a) => sum + a.amount, 0);
+    // Total distributed for a reward is linear in coreAmount.
+    const totalForThisReward = (totalOverridePercent / 100) * coreAmount;
 
     if (totalForThisReward > 0) {
       totalPotentialReceived += totalForThisReward;
@@ -389,7 +397,11 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
         rewardId: reward.id,
         coreReward: coreAmount,
         totalBonuses: totalForThisReward,
-        bonusBreakdown: allocations,
+        bonusBreakdown: allocationPercents.map((a) => ({
+          sponsorId: a.sponsorId,
+          percent: a.percent,
+          amount: (a.percent / 100) * coreAmount,
+        })),
         rewardDate: reward.reward_date
       });
     }
