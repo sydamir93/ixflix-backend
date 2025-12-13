@@ -34,18 +34,50 @@ async function getUserRankPercent(userId, trx = db) {
 }
 
 // Fetch upline chain (max 9 levels)
-async function getSponsorChain(userId, maxLevels = 9) {
+async function getSponsorChain(userId, maxLevels = 9, trx = db) {
+  const max = Number(maxLevels) || 0;
+  if (max <= 0) return [];
+
+  // Recursive CTE: user -> sponsor -> sponsor...
+  const raw = await trx.raw(
+    `
+      WITH RECURSIVE upl AS (
+        SELECT
+          g.user_id,
+          g.sponsor_id,
+          0 AS lvl
+        FROM genealogy g
+        WHERE g.user_id = ?
+
+        UNION ALL
+
+        SELECT
+          g.user_id,
+          g.sponsor_id,
+          upl.lvl + 1 AS lvl
+        FROM genealogy g
+        INNER JOIN upl ON g.user_id = upl.sponsor_id
+        WHERE upl.lvl + 1 < ?
+      )
+      SELECT sponsor_id, lvl
+      FROM upl
+      WHERE sponsor_id IS NOT NULL
+        AND sponsor_id <> user_id
+      ORDER BY lvl ASC
+    `,
+    [userId, max]
+  );
+
+  const rows = unwrapRawRows(raw);
+
+  // Defensive cycle handling in-memory (keeps old "visited" behavior).
   const chain = [];
   const visited = new Set();
-  let current = userId;
-
-  for (let i = 0; i < maxLevels; i++) {
-    const row = await db('genealogy').where({ user_id: current }).first();
-    if (!row || !row.sponsor_id || visited.has(row.sponsor_id)) break;
-
-    chain.push(row.sponsor_id);
-    visited.add(row.sponsor_id);
-    current = row.sponsor_id;
+  for (const r of rows) {
+    const sid = r?.sponsor_id ? Number(r.sponsor_id) : null;
+    if (!sid || visited.has(sid)) break;
+    visited.add(sid);
+    chain.push(sid);
   }
 
   return chain;
@@ -141,7 +173,7 @@ async function distributePowerPassUp({ originUserId, coreAmount, referenceId, tr
   const originUser = await trx('users').where({ id: originUserId }).select('name').first();
   const originUserName = originUser?.name || `User ${originUserId}`;
 
-  const chain = await getSponsorChain(originUserId, 9);
+  const chain = await getSponsorChain(originUserId, 9, trx);
   const allocations = [];
 
   let previousRankPercent = 0; // PDF-compliant: always start baseline at 0
@@ -418,7 +450,7 @@ async function calculatePotentialReceivedPowerPassUp(userId, trx = db) {
 async function simulatePowerPassUp({ originUserId, coreAmount, referenceId, trx = db }) {
   if (!coreAmount || coreAmount <= 0) return { distributed: 0, allocations: [] };
 
-  const chain = await getSponsorChain(originUserId, 9);
+  const chain = await getSponsorChain(originUserId, 9, trx);
   const allocations = [];
 
   let previousRankPercent = 0; // PDF-compliant: always start at 0
